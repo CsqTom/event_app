@@ -1,0 +1,315 @@
+import pickle
+import uuid
+import time
+import asyncio
+import multiprocessing
+from typing import Any, Callable, Optional, Dict, List
+
+import zmq
+import zmq.asyncio as async_zmq
+
+DEFAULT_ZMQ_CONFIG = {
+    "event_endpoint": "tcp://127.0.0.1:5555",
+    "rpc_endpoint": "tcp://127.0.0.1:5556"
+}
+
+
+def serialize_data(data: Any) -> bytes:
+    return pickle.dumps(data)
+
+
+def deserialize_data(data_bytes: bytes) -> Any:
+    return pickle.loads(data_bytes)
+
+
+class EventApp:
+    def __init__(self, redis_config: dict = None, group_name: str = "event_app_group"):
+        self.zmq_config = redis_config or DEFAULT_ZMQ_CONFIG
+        self.subscribers: Dict[str, List[Callable]] = {}
+        self.rpc_handlers: Dict[str, Callable] = {}
+        self.group_name = group_name
+
+        self._context: Optional[zmq.Context] = None
+        self._event_push: Optional[zmq.Socket] = None
+        self._event_pull: Optional[zmq.Socket] = None
+        self._rpc_rep: Optional[zmq.Socket] = None
+
+        self._async_context: Optional[async_zmq.Context] = None
+        self._async_event_push: Optional[async_zmq.Socket] = None
+        self._async_event_pull: Optional[async_zmq.Socket] = None
+        self._async_rpc_rep: Optional[async_zmq.Socket] = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_context"] = None
+        state["_event_push"] = None
+        state["_event_pull"] = None
+        state["_rpc_rep"] = None
+        state["_async_context"] = None
+        state["_async_event_push"] = None
+        state["_async_event_pull"] = None
+        state["_async_rpc_rep"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+    def _event_endpoint(self) -> str:
+        return self.zmq_config.get("event_endpoint", DEFAULT_ZMQ_CONFIG["event_endpoint"])
+
+    def _rpc_endpoint(self) -> str:
+        return self.zmq_config.get("rpc_endpoint", DEFAULT_ZMQ_CONFIG["rpc_endpoint"])
+
+    def _init_context(self):
+        if self._context is None:
+            self._context = zmq.Context.instance()
+
+    def _init_async_context(self):
+        if self._async_context is None:
+            self._async_context = async_zmq.Context.instance()
+
+    def _get_event_push(self) -> zmq.Socket:
+        self._init_context()
+        if self._event_push is None:
+            self._event_push = self._context.socket(zmq.PUSH)
+            self._event_push.linger = 0
+            self._event_push.connect(self._event_endpoint())
+        return self._event_push
+
+    def _get_async_event_push(self) -> async_zmq.Socket:
+        self._init_async_context()
+        if self._async_event_push is None:
+            self._async_event_push = self._async_context.socket(zmq.PUSH)
+            self._async_event_push.linger = 0
+            self._async_event_push.connect(self._event_endpoint())
+        return self._async_event_push
+
+    def _create_rpc_req(self) -> zmq.Socket:
+        self._init_context()
+        socket = self._context.socket(zmq.REQ)
+        socket.linger = 0
+        socket.connect(self._rpc_endpoint())
+        return socket
+
+    def _create_async_rpc_req(self) -> async_zmq.Socket:
+        self._init_async_context()
+        socket = self._async_context.socket(zmq.REQ)
+        socket.linger = 0
+        socket.connect(self._rpc_endpoint())
+        return socket
+
+    def subscribe(self, event_type: str):
+        def decorator(func: Callable) -> Callable:
+            if event_type not in self.subscribers:
+                self.subscribers[event_type] = []
+            self.subscribers[event_type].append(func)
+            return func
+
+        return decorator
+
+    def rpc(self, event_type: str):
+        def decorator(func: Callable) -> Callable:
+            self.rpc_handlers[event_type] = func
+            return func
+
+        return decorator
+
+    def publish(self, event_type: str, data: Any) -> None:
+        publish_data = {
+            "event_type": event_type,
+            "data": data,
+            "need_response": False,
+            "request_id": None
+        }
+        socket = self._get_event_push()
+        socket.send(serialize_data(publish_data))
+
+    def get(self, event_type: str, data: Any, timeout: float = 10.0) -> Any:
+        request_id = str(uuid.uuid4())
+        publish_data = {
+            "event_type": event_type,
+            "data": data,
+            "need_response": True,
+            "request_id": request_id,
+            "timestamp": time.time(),
+            "timeout": timeout
+        }
+        socket = self._create_rpc_req()
+        socket.send(serialize_data(publish_data))
+        poller = zmq.Poller()
+        poller.register(socket, zmq.POLLIN)
+        timeout_ms = int(max(timeout, 1) * 1000)
+        events = dict(poller.poll(timeout_ms))
+        if socket not in events:
+            socket.close()
+            raise TimeoutError(f"RPC调用 {event_type} 超时（{timeout}s）")
+        payload = socket.recv()
+        socket.close()
+        result_data = deserialize_data(payload)
+        if isinstance(result_data, dict) and "error" in result_data:
+            raise RuntimeError(f"RPC Remote Error: {result_data['error']}")
+        return result_data.get("data")
+
+    async def publish_async(self, event_type: str, data: Any) -> None:
+        publish_data = {
+            "event_type": event_type,
+            "data": data,
+            "need_response": False,
+            "request_id": None
+        }
+        socket = self._get_async_event_push()
+        await socket.send(serialize_data(publish_data))
+
+    async def get_async(self, event_type: str, data: Any, timeout: float = 10.0) -> Any:
+        request_id = str(uuid.uuid4())
+        publish_data = {
+            "event_type": event_type,
+            "data": data,
+            "need_response": True,
+            "request_id": request_id,
+            "timestamp": time.time(),
+            "timeout": timeout
+        }
+        socket = self._create_async_rpc_req()
+        await socket.send(serialize_data(publish_data))
+        poller = async_zmq.Poller()
+        poller.register(socket, zmq.POLLIN)
+        timeout_ms = int(max(timeout, 1) * 1000)
+        events = dict(await poller.poll(timeout_ms))
+        if socket not in events:
+            socket.close()
+            raise TimeoutError(f"异步RPC调用 {event_type} 超时（{timeout}s）")
+        payload = await socket.recv()
+        socket.close()
+        result_data = deserialize_data(payload)
+        if isinstance(result_data, dict) and "error" in result_data:
+            raise RuntimeError(f"Async RPC Remote Error: {result_data['error']}")
+        return result_data.get("data")
+
+    def _process_event(self, event_type: str, publish_data: dict):
+        data = publish_data["data"]
+        need_response = publish_data.get("need_response", False)
+        request_id = publish_data.get("request_id")
+        if need_response:
+            timestamp = publish_data.get("timestamp")
+            timeout = publish_data.get("timeout")
+            if timestamp and timeout:
+                if time.time() - timestamp > timeout:
+                    return {"request_id": request_id, "error": "timeout"}
+            if event_type in self.rpc_handlers:
+                try:
+                    handler = self.rpc_handlers[event_type]
+                    result = handler(data)
+                    return {"request_id": request_id, "data": result}
+                except Exception as e:
+                    return {"request_id": request_id, "error": str(e)}
+            return {"request_id": request_id, "error": f"no handler for {event_type}"}
+        if event_type in self.subscribers:
+            for handler in self.subscribers[event_type]:
+                try:
+                    handler(data)
+                except Exception:
+                    pass
+        return None
+
+    async def _process_event_async(self, event_type: str, publish_data: dict):
+        data = publish_data["data"]
+        need_response = publish_data.get("need_response", False)
+        request_id = publish_data.get("request_id")
+        if need_response:
+            timestamp = publish_data.get("timestamp")
+            timeout = publish_data.get("timeout")
+            if timestamp and timeout:
+                if time.time() - timestamp > timeout:
+                    return {"request_id": request_id, "error": "timeout"}
+            if event_type in self.rpc_handlers:
+                try:
+                    handler = self.rpc_handlers[event_type]
+                    if asyncio.iscoroutinefunction(handler):
+                        result = await handler(data)
+                    else:
+                        result = handler(data)
+                    return {"request_id": request_id, "data": result}
+                except Exception as e:
+                    return {"request_id": request_id, "error": str(e)}
+            return {"request_id": request_id, "error": f"no handler for {event_type}"}
+        if event_type in self.subscribers:
+            for handler in self.subscribers[event_type]:
+                try:
+                    if asyncio.iscoroutinefunction(handler):
+                        await handler(data)
+                    else:
+                        handler(data)
+                except Exception:
+                    pass
+        return None
+
+    def _listen_loop(self):
+        self._init_context()
+        if self._event_pull is None:
+            self._event_pull = self._context.socket(zmq.PULL)
+            self._event_pull.linger = 0
+            self._event_pull.bind(self._event_endpoint())
+        if self._rpc_rep is None:
+            self._rpc_rep = self._context.socket(zmq.REP)
+            self._rpc_rep.linger = 0
+            self._rpc_rep.bind(self._rpc_endpoint())
+        print(f"事件监听已启动 (PID: {multiprocessing.current_process().pid})，监听事件: {list(self.subscribers.keys())}")
+        poller = zmq.Poller()
+        poller.register(self._event_pull, zmq.POLLIN)
+        poller.register(self._rpc_rep, zmq.POLLIN)
+        while True:
+            events = dict(poller.poll(1000))
+            if self._event_pull in events:
+                payload = self._event_pull.recv()
+                publish_data = deserialize_data(payload)
+                event_type = publish_data.get("event_type")
+                if event_type:
+                    self._process_event(event_type, publish_data)
+            if self._rpc_rep in events:
+                payload = self._rpc_rep.recv()
+                publish_data = deserialize_data(payload)
+                event_type = publish_data.get("event_type")
+                response = {"request_id": publish_data.get("request_id"), "error": "invalid request"}
+                if event_type:
+                    response = self._process_event(event_type, publish_data) or response
+                self._rpc_rep.send(serialize_data(response))
+
+    def run(self, block: bool = True):
+        if block:
+            self._listen_loop()
+        else:
+            listener_thread = multiprocessing.Process(target=self._listen_loop)
+            listener_thread.daemon = True
+            listener_thread.start()
+
+    async def run_async(self):
+        self._init_async_context()
+        if self._async_event_pull is None:
+            self._async_event_pull = self._async_context.socket(zmq.PULL)
+            self._async_event_pull.linger = 0
+            self._async_event_pull.bind(self._event_endpoint())
+        if self._async_rpc_rep is None:
+            self._async_rpc_rep = self._async_context.socket(zmq.REP)
+            self._async_rpc_rep.linger = 0
+            self._async_rpc_rep.bind(self._rpc_endpoint())
+        print(f"异步事件监听已启动，监听事件: {list(self.subscribers.keys())}")
+        poller = async_zmq.Poller()
+        poller.register(self._async_event_pull, zmq.POLLIN)
+        poller.register(self._async_rpc_rep, zmq.POLLIN)
+        while True:
+            events = dict(await poller.poll(1000))
+            if self._async_event_pull in events:
+                payload = await self._async_event_pull.recv()
+                publish_data = deserialize_data(payload)
+                event_type = publish_data.get("event_type")
+                if event_type:
+                    await self._process_event_async(event_type, publish_data)
+            if self._async_rpc_rep in events:
+                payload = await self._async_rpc_rep.recv()
+                publish_data = deserialize_data(payload)
+                event_type = publish_data.get("event_type")
+                response = {"request_id": publish_data.get("request_id"), "error": "invalid request"}
+                if event_type:
+                    response = await self._process_event_async(event_type, publish_data) or response
+                await self._async_rpc_rep.send(serialize_data(response))
