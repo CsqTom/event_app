@@ -88,8 +88,4 @@ if __name__ == "__main__":
 
     benchmark("redis", RedisEventApp, None, payload)
 
-    zmq_config = {
-        "event_endpoint": "tcp://127.0.0.1:5560",
-        "rpc_endpoint": "tcp://127.0.0.1:5561"
-    }
-    benchmark("zeromq", ZmqEventApp, zmq_config, payload)
+    benchmark("zeromq", ZmqEventApp, None, payload)

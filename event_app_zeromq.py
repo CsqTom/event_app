@@ -1,3 +1,5 @@
+import os
+import tempfile
 import pickle
 import uuid
 import time
@@ -8,10 +10,35 @@ from typing import Any, Callable, Optional, Dict, List
 import zmq
 import zmq.asyncio as async_zmq
 
-DEFAULT_ZMQ_CONFIG = {
-    "event_endpoint": "tcp://127.0.0.1:5555",
-    "rpc_endpoint": "tcp://127.0.0.1:5556"
-}
+def _ipc_endpoint(name: str) -> str:
+    path = os.path.join(tempfile.gettempdir(), name)
+    return f"ipc://{path.replace(os.sep, '/')}"
+
+
+def _default_zmq_config() -> Dict[str, str]:
+    if os.name == "nt":
+        return {
+            "event_endpoint": "tcp://127.0.0.1:5555",
+            "rpc_endpoint": "tcp://127.0.0.1:5556"
+        }
+    return {
+        "event_endpoint": _ipc_endpoint("event_app_event.sock"),
+        "rpc_endpoint": _ipc_endpoint("event_app_rpc.sock")
+    }
+
+
+DEFAULT_ZMQ_CONFIG = _default_zmq_config()
+
+
+def _cleanup_ipc(endpoint: str):
+    if not endpoint.startswith("ipc://"):
+        return
+    path = endpoint[6:]
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 def serialize_data(data: Any) -> bytes:
@@ -33,11 +60,13 @@ class EventApp:
         self._event_push: Optional[zmq.Socket] = None
         self._event_pull: Optional[zmq.Socket] = None
         self._rpc_rep: Optional[zmq.Socket] = None
+        self._rpc_req: Optional[zmq.Socket] = None
 
         self._async_context: Optional[async_zmq.Context] = None
         self._async_event_push: Optional[async_zmq.Socket] = None
         self._async_event_pull: Optional[async_zmq.Socket] = None
         self._async_rpc_rep: Optional[async_zmq.Socket] = None
+        self._async_rpc_req: Optional[async_zmq.Socket] = None
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -45,10 +74,12 @@ class EventApp:
         state["_event_push"] = None
         state["_event_pull"] = None
         state["_rpc_rep"] = None
+        state["_rpc_req"] = None
         state["_async_context"] = None
         state["_async_event_push"] = None
         state["_async_event_pull"] = None
         state["_async_rpc_rep"] = None
+        state["_async_rpc_req"] = None
         return state
 
     def __setstate__(self, state):
@@ -84,19 +115,21 @@ class EventApp:
             self._async_event_push.connect(self._event_endpoint())
         return self._async_event_push
 
-    def _create_rpc_req(self) -> zmq.Socket:
+    def _get_rpc_req(self) -> zmq.Socket:
         self._init_context()
-        socket = self._context.socket(zmq.REQ)
-        socket.linger = 0
-        socket.connect(self._rpc_endpoint())
-        return socket
+        if self._rpc_req is None:
+            self._rpc_req = self._context.socket(zmq.REQ)
+            self._rpc_req.linger = 0
+            self._rpc_req.connect(self._rpc_endpoint())
+        return self._rpc_req
 
-    def _create_async_rpc_req(self) -> async_zmq.Socket:
+    def _get_async_rpc_req(self) -> async_zmq.Socket:
         self._init_async_context()
-        socket = self._async_context.socket(zmq.REQ)
-        socket.linger = 0
-        socket.connect(self._rpc_endpoint())
-        return socket
+        if self._async_rpc_req is None:
+            self._async_rpc_req = self._async_context.socket(zmq.REQ)
+            self._async_rpc_req.linger = 0
+            self._async_rpc_req.connect(self._rpc_endpoint())
+        return self._async_rpc_req
 
     def subscribe(self, event_type: str):
         def decorator(func: Callable) -> Callable:
@@ -134,17 +167,15 @@ class EventApp:
             "timestamp": time.time(),
             "timeout": timeout
         }
-        socket = self._create_rpc_req()
+        socket = self._get_rpc_req()
         socket.send(serialize_data(publish_data))
         poller = zmq.Poller()
         poller.register(socket, zmq.POLLIN)
         timeout_ms = int(max(timeout, 1) * 1000)
         events = dict(poller.poll(timeout_ms))
         if socket not in events:
-            socket.close()
             raise TimeoutError(f"RPC调用 {event_type} 超时（{timeout}s）")
         payload = socket.recv()
-        socket.close()
         result_data = deserialize_data(payload)
         if isinstance(result_data, dict) and "error" in result_data:
             raise RuntimeError(f"RPC Remote Error: {result_data['error']}")
@@ -170,17 +201,15 @@ class EventApp:
             "timestamp": time.time(),
             "timeout": timeout
         }
-        socket = self._create_async_rpc_req()
+        socket = self._get_async_rpc_req()
         await socket.send(serialize_data(publish_data))
         poller = async_zmq.Poller()
         poller.register(socket, zmq.POLLIN)
         timeout_ms = int(max(timeout, 1) * 1000)
         events = dict(await poller.poll(timeout_ms))
         if socket not in events:
-            socket.close()
             raise TimeoutError(f"异步RPC调用 {event_type} 超时（{timeout}s）")
         payload = await socket.recv()
-        socket.close()
         result_data = deserialize_data(payload)
         if isinstance(result_data, dict) and "error" in result_data:
             raise RuntimeError(f"Async RPC Remote Error: {result_data['error']}")
@@ -246,6 +275,8 @@ class EventApp:
 
     def _listen_loop(self):
         self._init_context()
+        _cleanup_ipc(self._event_endpoint())
+        _cleanup_ipc(self._rpc_endpoint())
         if self._event_pull is None:
             self._event_pull = self._context.socket(zmq.PULL)
             self._event_pull.linger = 0
@@ -285,6 +316,8 @@ class EventApp:
 
     async def run_async(self):
         self._init_async_context()
+        _cleanup_ipc(self._event_endpoint())
+        _cleanup_ipc(self._rpc_endpoint())
         if self._async_event_pull is None:
             self._async_event_pull = self._async_context.socket(zmq.PULL)
             self._async_event_pull.linger = 0
