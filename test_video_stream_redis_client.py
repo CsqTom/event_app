@@ -1,5 +1,6 @@
 import time
 import threading
+import queue
 
 from event_app_redis import EventApp
 
@@ -7,15 +8,23 @@ from event_app_redis import EventApp
 def run_client():
     app = EventApp(group_name="video_stream_client")
     counters = {"received": 0}
+    log_queue: queue.SimpleQueue = queue.SimpleQueue()
+
+    def log_worker():
+        while True:
+            message = log_queue.get()
+            print(message)
+
+    logger_thread = threading.Thread(target=log_worker, daemon=True)
+    logger_thread.start()
 
     @app.subscribe("image_frame")
     def on_frame(data):
         counters["received"] += 1
-        print(f"on_frame -> {counters['received']}")
+        log_queue.put(f"{time.time()} on_frame -> {counters['received']}")
         if isinstance(data, dict):
-            processed = dict(data)
-            processed["processed"] = True
-            app.publish("image_frame_processed", processed)
+            data["processed"] = True
+            app.publish("image_frame_processed", data)
 
     listener_thread = threading.Thread(target=app._listen_loop, daemon=True)
     listener_thread.start()
@@ -28,7 +37,7 @@ def run_client():
     )
     print(f"stream_open -> {open_result}")
 
-    time.sleep(2)
+    time.sleep(30)
     close_result = app.get("stream_close", {"id": "stream-001"}, timeout=5.0)
     print(f"stream_close -> {close_result}")
 

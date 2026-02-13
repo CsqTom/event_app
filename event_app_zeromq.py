@@ -5,6 +5,8 @@ import uuid
 import time
 import asyncio
 import multiprocessing
+import queue
+import threading
 from typing import Any, Callable, Optional, Dict, List
 
 import zmq
@@ -62,6 +64,9 @@ class EventApp:
         self.subscribers: Dict[str, List[Callable]] = {}
         self.rpc_handlers: Dict[str, Callable] = {}
         self.group_name = group_name
+        self._publish_queue: queue.Queue = queue.Queue(maxsize=1000)
+        self._publish_thread: Optional[threading.Thread] = None
+        self._handler_local = threading.local()
 
         self._context: Optional[zmq.Context] = None
         self._event_push: Optional[zmq.Socket] = None
@@ -87,10 +92,21 @@ class EventApp:
         state["_async_event_pull"] = None
         state["_async_rpc_rep"] = None
         state["_async_rpc_req"] = None
+        state["_publish_queue"] = None
+        state["_publish_thread"] = None
+        state["_handler_local"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        if self.__dict__.get("_publish_queue") is None:
+            self._publish_queue = queue.Queue(maxsize=1000)
+        self._publish_thread = None
+        if self.__dict__.get("_handler_local") is None:
+            self._handler_local = threading.local()
+
+    def _in_handler(self) -> bool:
+        return getattr(self._handler_local, "active", False)
 
     def _event_endpoint(self) -> str:
         return self.zmq_config.get("event_endpoint", DEFAULT_ZMQ_CONFIG["event_endpoint"])
@@ -155,6 +171,9 @@ class EventApp:
         return decorator
 
     def publish(self, event_type: str, data: Any) -> None:
+        if self._in_handler():
+            self._enqueue_publish(event_type, data)
+            return
         publish_data = {
             "event_type": event_type,
             "data": data,
@@ -163,6 +182,52 @@ class EventApp:
         }
         socket = self._get_event_push()
         socket.send(serialize_data(publish_data))
+
+    def _publish_worker(self):
+        while True:
+            event_type, data = self._publish_queue.get()
+            try:
+                self.publish(event_type, data)
+            finally:
+                self._publish_queue.task_done()
+
+    def _ensure_publish_worker(self):
+        if self._publish_thread is None or not self._publish_thread.is_alive():
+            self._publish_thread = threading.Thread(target=self._publish_worker, daemon=True)
+            self._publish_thread.start()
+
+    def _enqueue_publish(self, event_type: str, data: Any) -> None:
+        self._ensure_publish_worker()
+        try:
+            self._publish_queue.put_nowait((event_type, data))
+        except queue.Full:
+            pass
+
+    def _publish_from_handler(self, result: Any) -> None:
+        if result is None:
+            return
+        if isinstance(result, tuple) and len(result) == 2:
+            self._enqueue_publish(result[0], result[1])
+            return
+        if isinstance(result, dict) and "event_type" in result and "data" in result:
+            self._enqueue_publish(result["event_type"], result["data"])
+            return
+        if isinstance(result, (list, tuple)):
+            for item in result:
+                self._publish_from_handler(item)
+
+    async def _publish_from_handler_async(self, result: Any) -> None:
+        if result is None:
+            return
+        if isinstance(result, tuple) and len(result) == 2:
+            self._enqueue_publish(result[0], result[1])
+            return
+        if isinstance(result, dict) and "event_type" in result and "data" in result:
+            self._enqueue_publish(result["event_type"], result["data"])
+            return
+        if isinstance(result, (list, tuple)):
+            for item in result:
+                await self._publish_from_handler_async(item)
 
     def get(self, event_type: str, data: Any, timeout: float = 10.0) -> Any:
         request_id = str(uuid.uuid4())
@@ -243,7 +308,12 @@ class EventApp:
         if event_type in self.subscribers:
             for handler in self.subscribers[event_type]:
                 try:
-                    handler(data)
+                    self._handler_local.active = True
+                    try:
+                        result = handler(data)
+                    finally:
+                        self._handler_local.active = False
+                    self._publish_from_handler(result)
                 except Exception:
                     pass
         return None
@@ -272,10 +342,15 @@ class EventApp:
         if event_type in self.subscribers:
             for handler in self.subscribers[event_type]:
                 try:
-                    if asyncio.iscoroutinefunction(handler):
-                        await handler(data)
-                    else:
-                        handler(data)
+                    self._handler_local.active = True
+                    try:
+                        if asyncio.iscoroutinefunction(handler):
+                            result = await handler(data)
+                        else:
+                            result = handler(data)
+                    finally:
+                        self._handler_local.active = False
+                    await self._publish_from_handler_async(result)
                 except Exception:
                     pass
         return None

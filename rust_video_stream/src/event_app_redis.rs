@@ -203,9 +203,9 @@ impl EventAppRedis {
                 .arg(&self.group_name)
                 .arg(&consumer)
                 .arg("BLOCK")
-                .arg(1000)
+                .arg(50)
                 .arg("COUNT")
-                .arg(20)
+                .arg(1)
                 .arg("STREAMS");
             for key in &stream_keys {
                 cmd.arg(key);
