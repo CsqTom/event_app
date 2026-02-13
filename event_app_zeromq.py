@@ -50,6 +50,13 @@ def deserialize_data(data_bytes: bytes) -> Any:
 
 
 class EventApp:
+    def __new__(cls, redis_config: dict = None, group_name: str = "event_app_group"):
+        if os.name == "nt" and redis_config is None:
+            from event_app_redis import EventApp as RedisEventApp
+
+            return RedisEventApp(redis_config=None, group_name=group_name)
+        return super().__new__(cls)
+
     def __init__(self, redis_config: dict = None, group_name: str = "event_app_group"):
         self.zmq_config = redis_config or DEFAULT_ZMQ_CONFIG
         self.subscribers: Dict[str, List[Callable]] = {}
