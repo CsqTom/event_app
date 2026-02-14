@@ -1,8 +1,20 @@
 import time
 import threading
 import queue
+from typing import Optional
+
+from pydantic import BaseModel
 
 from event_app_redis import EventApp
+
+class ImageFrame(BaseModel):
+    id: str
+    frame_id: int
+    width: int
+    height: int
+    format: str
+    data: str
+    processed: Optional[bool] = None
 
 
 def run_client():
@@ -18,7 +30,7 @@ def run_client():
     logger_thread = threading.Thread(target=log_worker, daemon=True)
     logger_thread.start()
 
-    @app.subscribe("image_frame")
+    @app.subscribe("image_frame", ImageFrame)
     def on_frame(data):
         counters["received"] += 1
         log_queue.put(f"{time.time()} on_frame -> {counters['received']}")

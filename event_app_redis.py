@@ -10,6 +10,7 @@ import numpy as np
 
 import redis
 import redis.asyncio as async_redis
+from pydantic import BaseModel, ValidationError
 
 # -------------------------- 基础配置 & 工具函数 --------------------------
 DEFAULT_REDIS_CONFIG = {
@@ -28,6 +29,10 @@ def serialize_data(data: Any) -> bytes:
 def deserialize_data(data_bytes: bytes) -> Any:
     """反序列化"""
     return pickle.loads(data_bytes)
+
+
+class EventSchemaError(ValueError):
+    pass
 
 
 # -------------------------- Redis 连接管理 --------------------------
@@ -73,6 +78,8 @@ class EventApp:
         self._publish_queue: queue.Queue = queue.Queue(maxsize=1000)
         self._publish_thread: Optional[threading.Thread] = None
         self._handler_local = threading.local()
+        self._event_specs: Dict[str, Dict[str, Any]] = {}
+        self._rpc_specs: Dict[str, Dict[str, Any]] = {}
 
     def _init_sync_redis(self):
         if self.sync_redis is None:
@@ -102,6 +109,73 @@ class EventApp:
     def _stream_key(self, event_type: str) -> str:
         return f"event:{event_type}:stream"
 
+    def _ensure_model(self, model: type[BaseModel], label: str) -> type[BaseModel]:
+        if model is None:
+            raise EventSchemaError(f"{label} model required")
+        try:
+            if not issubclass(model, BaseModel):
+                raise EventSchemaError(f"{label} model must inherit BaseModel")
+        except TypeError as exc:
+            raise EventSchemaError(f"{label} model must inherit BaseModel") from exc
+        return model
+
+    def _normalize_payload(self, data: Any) -> Any:
+        if isinstance(data, BaseModel):
+            return data.model_dump()
+        return data
+
+    def _coerce_model(self, model: type[BaseModel], data: Any) -> Any:
+        if model is None:
+            return data
+        if isinstance(data, model):
+            return data
+        if isinstance(data, BaseModel):
+            data = data.model_dump()
+        return model.model_validate(data)
+
+    def _validate_model(self, model: type[BaseModel], data: Any) -> None:
+        if model is None:
+            return
+        try:
+            self._coerce_model(model, data)
+        except ValidationError as exc:
+            raise EventSchemaError(str(exc)) from exc
+
+    def _validate_event_payload(self, event_type: str, data: Any) -> None:
+        spec = self._event_specs.get(event_type)
+        if not spec:
+            return
+        model = spec.get("model")
+        self._validate_model(model, data)
+
+    def _coerce_event_payload(self, event_type: str, data: Any) -> Any:
+        spec = self._event_specs.get(event_type)
+        if not spec:
+            return data
+        model = spec.get("model")
+        return self._coerce_model(model, data)
+
+    def _validate_rpc_request(self, event_type: str, data: Any) -> None:
+        spec = self._rpc_specs.get(event_type)
+        if not spec:
+            return
+        model = spec.get("request_model")
+        self._validate_model(model, data)
+
+    def _coerce_rpc_request(self, event_type: str, data: Any) -> Any:
+        spec = self._rpc_specs.get(event_type)
+        if not spec:
+            return data
+        model = spec.get("request_model")
+        return self._coerce_model(model, data)
+
+    def _validate_rpc_response(self, event_type: str, data: Any) -> None:
+        spec = self._rpc_specs.get(event_type)
+        if not spec:
+            return
+        model = spec.get("response_model")
+        self._validate_model(model, data)
+
     def _ensure_group(self, stream_key: str):
         try:
             self.sync_redis.xgroup_create(stream_key, self.consumer_group, id="0", mkstream=True)
@@ -109,11 +183,16 @@ class EventApp:
             if "BUSYGROUP" not in str(e):
                 raise
 
-    def subscribe(self, event_type: str):
+    def subscribe(self, event_type: str, model: type[BaseModel]):
         """
         订阅装饰器（异步，多订阅）
         支持多个函数订阅同一个事件
         """
+        model = self._ensure_model(model, "event")
+        existing = self._event_specs.get(event_type)
+        if existing and existing.get("model") is not model:
+            raise EventSchemaError(f"event model already registered for {event_type}")
+        self._event_specs[event_type] = {"model": model}
 
         def decorator(func: Callable) -> Callable:
             if event_type not in self.subscribers:
@@ -123,11 +202,18 @@ class EventApp:
 
         return decorator
 
-    def rpc(self, event_type: str):
+    def rpc(self, event_type: str, request_model: type[BaseModel], response_model: type[BaseModel]):
         """
         RPC装饰器（同步，请求-响应）
         每个事件类型通常只有一个RPC处理器
         """
+        request_model = self._ensure_model(request_model, "request")
+        response_model = self._ensure_model(response_model, "response")
+        existing = self._rpc_specs.get(event_type)
+        if existing:
+            if existing.get("request_model") is not request_model or existing.get("response_model") is not response_model:
+                raise EventSchemaError(f"rpc model already registered for {event_type}")
+        self._rpc_specs[event_type] = {"request_model": request_model, "response_model": response_model}
 
         def decorator(func: Callable) -> Callable:
             self.rpc_handlers[event_type] = func
@@ -139,6 +225,8 @@ class EventApp:
         """
         发布事件（异步/Fire-and-Forget）
         """
+        self._validate_event_payload(event_type, data)
+        data = self._normalize_payload(data)
         if self._in_handler():
             self._enqueue_publish(event_type, data)
             return
@@ -179,10 +267,12 @@ class EventApp:
         if result is None:
             return
         if isinstance(result, tuple) and len(result) == 2:
-            self._enqueue_publish(result[0], result[1])
+            self._validate_event_payload(result[0], result[1])
+            self._enqueue_publish(result[0], self._normalize_payload(result[1]))
             return
         if isinstance(result, dict) and "event_type" in result and "data" in result:
-            self._enqueue_publish(result["event_type"], result["data"])
+            self._validate_event_payload(result["event_type"], result["data"])
+            self._enqueue_publish(result["event_type"], self._normalize_payload(result["data"]))
             return
         if isinstance(result, (list, tuple)):
             for item in result:
@@ -192,10 +282,12 @@ class EventApp:
         if result is None:
             return
         if isinstance(result, tuple) and len(result) == 2:
-            self._enqueue_publish(result[0], result[1])
+            self._validate_event_payload(result[0], result[1])
+            self._enqueue_publish(result[0], self._normalize_payload(result[1]))
             return
         if isinstance(result, dict) and "event_type" in result and "data" in result:
-            self._enqueue_publish(result["event_type"], result["data"])
+            self._validate_event_payload(result["event_type"], result["data"])
+            self._enqueue_publish(result["event_type"], self._normalize_payload(result["data"]))
             return
         if isinstance(result, (list, tuple)):
             for item in result:
@@ -206,6 +298,8 @@ class EventApp:
         RPC调用（同步/Request-Response）
         """
         self._init_sync_redis()
+        self._validate_rpc_request(event_type, data)
+        data = self._normalize_payload(data)
 
         request_id = str(uuid.uuid4())
         response_key = f"event:response:{request_id}"
@@ -250,16 +344,19 @@ class EventApp:
         # 结果结构: {"request_id": ..., "data": ...}
         if isinstance(result_data, dict) and "error" in result_data:
             raise RuntimeError(f"RPC Remote Error: {result_data['error']}")
-
-        return result_data.get("data")
+        result = result_data.get("data")
+        self._validate_rpc_response(event_type, result)
+        return result
 
     async def publish_async(self, event_type: str, data: Any) -> None:
         """
         异步发布事件
         """
+        self._validate_event_payload(event_type, data)
         if self._in_handler():
             self._enqueue_publish(event_type, data)
             return
+        data = self._normalize_payload(data)
         if self.async_redis is None:
             self.async_redis = await AsyncRedisClient.get_instance(self.redis_config)
 
@@ -278,6 +375,8 @@ class EventApp:
         """
         if self.async_redis is None:
             self.async_redis = await AsyncRedisClient.get_instance(self.redis_config)
+        self._validate_rpc_request(event_type, data)
+        data = self._normalize_payload(data)
 
         request_id = str(uuid.uuid4())
         response_key = f"event:response:{request_id}"
@@ -314,8 +413,9 @@ class EventApp:
 
         if isinstance(result_data, dict) and "error" in result_data:
             raise RuntimeError(f"Async RPC Remote Error: {result_data['error']}")
-
-        return result_data.get("data")
+        result = result_data.get("data")
+        self._validate_rpc_response(event_type, result)
+        return result
 
     def _process_event(self, event_type: str, publish_data: dict):
         """处理收到的事件"""
@@ -325,6 +425,16 @@ class EventApp:
         reply_to = publish_data.get("reply_to")
 
         if need_response:
+            try:
+                self._validate_rpc_request(event_type, data)
+            except EventSchemaError as e:
+                if reply_to:
+                    self.sync_redis.rpush(
+                        reply_to,
+                        serialize_data({"request_id": request_id, "error": str(e)}),
+                    )
+                    self.sync_redis.expire(reply_to, 60)
+                return
             # Server-side timeout check
             timestamp = publish_data.get("timestamp")
             timeout = publish_data.get("timeout")
@@ -340,13 +450,14 @@ class EventApp:
                     handler = self.rpc_handlers[event_type]
                     self._handler_local.active = True
                     try:
-                        result = handler(data)
+                        result = handler(self._coerce_rpc_request(event_type, data))
                     finally:
                         self._handler_local.active = False
-
+                    self._validate_rpc_response(event_type, result)
                     # 发送响应 (List Push)
                     if reply_to:
-                        self.sync_redis.rpush(reply_to, serialize_data({"request_id": request_id, "data": result}))
+                        normalized = self._normalize_payload(result)
+                        self.sync_redis.rpush(reply_to, serialize_data({"request_id": request_id, "data": normalized}))
                         self.sync_redis.expire(reply_to, 60)  # 1分钟过期，防止残留
                 except Exception as e:
                     print(f"RPC {event_type} 处理失败: {e}")
@@ -358,11 +469,16 @@ class EventApp:
         else:
             # 订阅 处理
             if event_type in self.subscribers:
+                try:
+                    self._validate_event_payload(event_type, data)
+                except EventSchemaError as e:
+                    print(f"事件 {event_type} payload 校验失败: {e}")
+                    return
                 for handler in self.subscribers[event_type]:
                     try:
                         self._handler_local.active = True
                         try:
-                            result = handler(data)
+                            result = handler(self._coerce_event_payload(event_type, data))
                         finally:
                             self._handler_local.active = False
                         self._publish_from_handler(result)
@@ -381,6 +497,16 @@ class EventApp:
         reply_to = publish_data.get("reply_to")
 
         if need_response:
+            try:
+                self._validate_rpc_request(event_type, data)
+            except EventSchemaError as e:
+                if reply_to:
+                    await self.async_redis.rpush(
+                        reply_to,
+                        serialize_data({"request_id": request_id, "error": str(e)}),
+                    )
+                    await self.async_redis.expire(reply_to, 60)
+                return
             # Server-side timeout check
             timestamp = publish_data.get("timestamp")
             timeout = publish_data.get("timeout")
@@ -396,15 +522,16 @@ class EventApp:
                     self._handler_local.active = True
                     try:
                         if asyncio.iscoroutinefunction(handler):
-                            result = await handler(data)
+                            result = await handler(self._coerce_rpc_request(event_type, data))
                         else:
-                            result = handler(data)
+                            result = handler(self._coerce_rpc_request(event_type, data))
                     finally:
                         self._handler_local.active = False
-
+                    self._validate_rpc_response(event_type, result)
                     if reply_to:
+                        normalized = self._normalize_payload(result)
                         await self.async_redis.rpush(reply_to,
-                                                     serialize_data({"request_id": request_id, "data": result}))
+                                                     serialize_data({"request_id": request_id, "data": normalized}))
                         await self.async_redis.expire(reply_to, 60)
                 except Exception as e:
                     print(f"Async RPC {event_type} 处理失败: {e}")
@@ -414,14 +541,19 @@ class EventApp:
                         await self.async_redis.expire(reply_to, 60)
         else:
             if event_type in self.subscribers:
+                try:
+                    self._validate_event_payload(event_type, data)
+                except EventSchemaError as e:
+                    print(f"Async 事件 {event_type} payload 校验失败: {e}")
+                    return
                 for handler in self.subscribers[event_type]:
                     try:
                         self._handler_local.active = True
                         try:
                             if asyncio.iscoroutinefunction(handler):
-                                result = await handler(data)
+                                result = await handler(self._coerce_event_payload(event_type, data))
                             else:
-                                result = handler(data)
+                                result = handler(self._coerce_event_payload(event_type, data))
                         finally:
                             self._handler_local.active = False
                         await self._publish_from_handler_async(result)

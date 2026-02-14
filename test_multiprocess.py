@@ -1,8 +1,20 @@
 import time
 import multiprocessing
 import os
+
+from pydantic import BaseModel
+
 from event_app_redis import EventApp
 from q_log.log_nb import logger
+
+class TestTopicEvent(BaseModel):
+    message: str
+
+class TestRpcRequest(BaseModel):
+    text: str
+
+class TestRpcResponse(BaseModel):
+    result: str
 
 def run_server():
     """Simulates a server process that handles events and RPCs"""
@@ -11,17 +23,17 @@ def run_server():
     server_app = EventApp(group_name="server_process_group")
 
     # 1. Register Subscribers (Multi-subscription test)
-    @server_app.subscribe("test_topic")
+    @server_app.subscribe("test_topic", TestTopicEvent)
     def handle_topic_1(data):
         logger.info(f"[Server PID {os.getpid()}] Subscriber 1 received: {data}")
 
     # 2. Register RPC
-    @server_app.rpc("test_rpc")
+    @server_app.rpc("test_rpc", TestRpcRequest, TestRpcResponse)
     def handle_rpc(data):
         logger.info(f"[Server PID {os.getpid()}] RPC processing: {data}")
         # Simulate some processing time
         # time.sleep(0.5)
-        return f"Processed '{data}' by PID {os.getpid()}"
+        return {"result": f"Processed '{data['text']}' by PID {os.getpid()}"}
 
     logger.info(f"[Server PID {os.getpid()}] Starting event loop...")
     # Blocking run to keep the process alive and listening
@@ -43,20 +55,20 @@ def run_client():
 
     # Test 1: Publish (Async, Multi-subscriber)
     logger.info(f"\n[Client] Publishing to 'test_topic'...")
-    client_app.publish("test_topic", "Hello Distributed World")
+    client_app.publish("test_topic", {"message": "Hello Distributed World"})
     
     # Test 2: RPC (Sync)
     logger.info(f"\n[Client] Calling RPC 'test_rpc'...")
     try:
         start = time.time()
         # Timeout set to 5s
-        response = client_app.get("test_rpc", "RPC Request Data", timeout=5.0)
+        response = client_app.get("test_rpc", {"text": "RPC Request Data"}, timeout=5.0)
         duration = time.time() - start
         logger.info(f"[Client] RPC Response: {response}")
         logger.info(f"[Client] RPC Duration: {duration:.4f}s")
 
         start2 = time.time()
-        response = client_app.get("test_rpc", "RPC Request Data", timeout=5.0)
+        response = client_app.get("test_rpc", {"text": "RPC Request Data"}, timeout=5.0)
         duration = time.time() - start2
         logger.info(f"[Client] RPC Response: {response}")
         logger.info(f"[Client] RPC Duration: {duration:.4f}s")

@@ -1,7 +1,9 @@
 import os
 import time
 import threading
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+
+from pydantic import BaseModel
 
 from event_app_redis import EventApp
 
@@ -61,11 +63,24 @@ def run_server():
     payload = load_image_bytes()
     manager = StreamTaskManager(app, payload)
 
-    @app.rpc("stream_open")
+    class StreamOpenRequest(BaseModel):
+        id: str
+        rtmp_url: str
+        rtmp_result_url: str
+
+    class StreamCloseRequest(BaseModel):
+        id: str
+
+    class StreamResponse(BaseModel):
+        status: str
+        id: Optional[str] = None
+        error: Optional[str] = None
+
+    @app.rpc("stream_open", StreamOpenRequest, StreamResponse)
     def stream_open(data: Dict[str, Any]):
         return manager.open(data)
 
-    @app.rpc("stream_close")
+    @app.rpc("stream_close", StreamCloseRequest, StreamResponse)
     def stream_close(data: Dict[str, Any]):
         return manager.close(data)
 

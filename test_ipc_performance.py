@@ -3,8 +3,26 @@ import time
 import multiprocessing
 from typing import Any, Dict, Optional
 
+from pydantic import BaseModel
+
 from event_app_redis import EventApp as RedisEventApp
 from event_app_zeromq import EventApp as ZmqEventApp
+
+
+class ImageEvent(BaseModel):
+    data: bytes
+
+class ImageRpcRequest(BaseModel):
+    data: bytes
+
+class ImageRpcResponse(BaseModel):
+    length: int
+
+class MetricsRequest(BaseModel):
+    pass
+
+class MetricsResponse(BaseModel):
+    count: int
 
 
 def load_image_bytes() -> bytes:
@@ -17,15 +35,15 @@ def run_server(app_cls, config: Optional[Dict[str, Any]], group_name: str):
     app = app_cls(redis_config=config, group_name=group_name)
     counter = {"count": 0}
 
-    @app.subscribe("image_event")
+    @app.subscribe("image_event", ImageEvent)
     def on_image(data):
         counter["count"] += 1
 
-    @app.rpc("image_rpc")
+    @app.rpc("image_rpc", ImageRpcRequest, ImageRpcResponse)
     def on_rpc(data):
-        return len(data)
+        return {"length": len(data["data"])}
 
-    @app.rpc("get_metrics")
+    @app.rpc("get_metrics", MetricsRequest, MetricsResponse)
     def get_metrics(_):
         return {"count": counter["count"]}
 
@@ -37,17 +55,17 @@ def run_client(app_cls, config: Optional[Dict[str, Any]], group_name: str, paylo
 
     start_publish = time.perf_counter()
     for _ in range(publish_count):
-        app.publish("image_event", payload)
+        app.publish("image_event", {"data": payload})
     publish_duration = time.perf_counter() - start_publish
 
     time.sleep(0.5)
-    metrics = app.get("get_metrics", None, timeout=10.0)
+    metrics = app.get("get_metrics", {}, timeout=10.0)
     received = metrics.get("count", 0) if isinstance(metrics, dict) else 0
 
     start_rpc = time.perf_counter()
     last_size = None
     for _ in range(rpc_count):
-        last_size = app.get("image_rpc", payload, timeout=10.0)
+        last_size = app.get("image_rpc", {"data": payload}, timeout=10.0)
     rpc_duration = time.perf_counter() - start_rpc
 
     return {
@@ -56,7 +74,7 @@ def run_client(app_cls, config: Optional[Dict[str, Any]], group_name: str, paylo
         "received_count": received,
         "rpc_duration": rpc_duration,
         "rpc_count": rpc_count,
-        "last_rpc_size": last_size,
+        "last_rpc_size": last_size.get("length") if isinstance(last_size, dict) else last_size,
     }
 
 
