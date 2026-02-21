@@ -109,6 +109,18 @@ class EventApp:
     def _stream_key(self, event_type: str) -> str:
         return f"event:{event_type}:stream"
 
+    def _channel_key(self, event_type: str) -> str:
+        return f"event:{event_type}:channel"
+
+    def _event_type_from_channel(self, channel: Union[str, bytes]) -> str:
+        if isinstance(channel, bytes):
+            channel = channel.decode()
+        prefix = "event:"
+        suffix = ":channel"
+        if channel.startswith(prefix) and channel.endswith(suffix):
+            return channel[len(prefix):-len(suffix)]
+        return channel
+
     def _ensure_model(self, model: type[BaseModel], label: str) -> type[BaseModel]:
         if model is None:
             raise EventSchemaError(f"{label} model required")
@@ -176,12 +188,14 @@ class EventApp:
         model = spec.get("response_model")
         self._validate_model(model, data)
 
-    def _ensure_group(self, stream_key: str):
+    def _ensure_group(self, stream_key: str, start_id: str = "0", reset_last_id: bool = False):
         try:
-            self.sync_redis.xgroup_create(stream_key, self.consumer_group, id="0", mkstream=True)
+            self.sync_redis.xgroup_create(stream_key, self.consumer_group, id=start_id, mkstream=True)
         except redis.exceptions.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
+            if reset_last_id:
+                self.sync_redis.xgroup_setid(stream_key, self.consumer_group, start_id)
 
     def subscribe(self, event_type: str, model: type[BaseModel]):
         """
@@ -238,10 +252,8 @@ class EventApp:
             "request_id": None
         }
 
-        stream_key = self._stream_key(event_type)
-        # 确保流存在，虽然xadd会自动创建，但这里主要为了统一逻辑
-        # 注意：这里不一定需要ensure_group，只有消费者需要。但发布者如果是第一次发布，xadd会自动创建流。
-        self.sync_redis.xadd(stream_key, {"payload": serialize_data(publish_data)})
+        channel_key = self._channel_key(event_type)
+        self.sync_redis.publish(channel_key, serialize_data(publish_data))
 
     def _publish_worker(self):
         while True:
@@ -366,8 +378,8 @@ class EventApp:
             "request_id": None
         }
 
-        stream_key = self._stream_key(event_type)
-        await self.async_redis.xadd(stream_key, {"payload": serialize_data(publish_data)})
+        channel_key = self._channel_key(event_type)
+        await self.async_redis.publish(channel_key, serialize_data(publish_data))
 
     async def get_async(self, event_type: str, data: Any, timeout: float = 10.0) -> Any:
         """
@@ -565,20 +577,43 @@ class EventApp:
         if self.sync_redis is None:
             self.sync_redis = SyncRedisClient.get_instance(self.redis_config)
 
-        # 重新收集流
-        all_events = set(self.subscribers.keys()) | set(self.rpc_handlers.keys())
+        channel_keys = []
+        if self.subscribers:
+            channel_keys = [self._channel_key(event_type) for event_type in self.subscribers.keys()]
+            pubsub = self.sync_redis.pubsub(ignore_subscribe_messages=True)
+            pubsub.subscribe(*channel_keys)
+        else:
+            pubsub = None
+
+        # 重新收集 RPC 流
+        all_events = set(self.rpc_handlers.keys())
         stream_keys = []
         for event_type in all_events:
             stream_key = self._stream_key(event_type)
             stream_keys.append(stream_key)
-            self._ensure_group(stream_key)
+            self._ensure_group(stream_key, start_id="$", reset_last_id=True)
 
-        print(f"事件监听已启动 (PID: {multiprocessing.current_process().pid})，监听流: {list(all_events)}")
+        print(f"事件监听已启动 (PID: {multiprocessing.current_process().pid})，订阅: {list(self.subscribers.keys())}，RPC: {list(all_events)}")
 
         consumer_name = f"consumer-{multiprocessing.current_process().pid}"
         while True:
+            pubsub_timeout = 0.05 if stream_keys else 0.001
+            if pubsub is not None:
+                message = pubsub.get_message(timeout=pubsub_timeout)
+                if message and message.get("type") == "message":
+                    channel = message.get("channel")
+                    payload = message.get("data")
+                    event_type = self._event_type_from_channel(channel)
+                    if payload:
+                        try:
+                            publish_data = deserialize_data(payload)
+                            self._process_event(event_type, publish_data)
+                        except Exception as e:
+                            print(f"PubSub Data process error: {e}")
+
             if not stream_keys:
-                time.sleep(1)
+                if pubsub is None:
+                    time.sleep(0.05)
                 continue
 
             streams = {key: ">" for key in stream_keys}
@@ -615,6 +650,7 @@ class EventApp:
                         print(f"Data process error: {e}")
 
                     self.sync_redis.xack(stream_name, self.consumer_group, message_id)
+                    self.sync_redis.xdel(stream_name, message_id)
 
     def run(self, block: bool = True):
         """启动监听"""
@@ -630,24 +666,50 @@ class EventApp:
         if self.async_redis is None:
             self.async_redis = await AsyncRedisClient.get_instance(self.redis_config)
 
-        all_events = set(self.subscribers.keys()) | set(self.rpc_handlers.keys())
+        channel_keys = [self._channel_key(event_type) for event_type in self.subscribers.keys()]
+        pubsub = None
+        if channel_keys:
+            pubsub = self.async_redis.pubsub(ignore_subscribe_messages=True)
+            await pubsub.subscribe(*channel_keys)
+
+        async def pubsub_loop():
+            if pubsub is None:
+                return
+            async for message in pubsub.listen():
+                if not message or message.get("type") != "message":
+                    continue
+                channel = message.get("channel")
+                payload = message.get("data")
+                event_type = self._event_type_from_channel(channel)
+                if not payload:
+                    continue
+                try:
+                    publish_data = deserialize_data(payload)
+                    await self._process_event_async(event_type, publish_data)
+                except Exception as e:
+                    print(f"Async PubSub Data process error: {e}")
+
+        asyncio.create_task(pubsub_loop())
+
+        all_events = set(self.rpc_handlers.keys())
         stream_keys = []
 
         for event_type in all_events:
             stream_key = self._stream_key(event_type)
             stream_keys.append(stream_key)
             try:
-                await self.async_redis.xgroup_create(stream_key, self.consumer_group, id="0", mkstream=True)
+                await self.async_redis.xgroup_create(stream_key, self.consumer_group, id="$", mkstream=True)
             except redis.exceptions.ResponseError as e:
                 if "BUSYGROUP" not in str(e):
                     raise
+                await self.async_redis.xgroup_setid(stream_key, self.consumer_group, "$")
 
-        print(f"异步事件监听已启动，监听流: {list(all_events)}")
+        print(f"异步事件监听已启动，订阅: {list(self.subscribers.keys())}，RPC: {list(all_events)}")
 
         consumer_name = f"consumer-{multiprocessing.current_process().pid}"
         while True:
             if not stream_keys:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.05)
                 continue
 
             streams = {key: ">" for key in stream_keys}
@@ -684,3 +746,4 @@ class EventApp:
                         print(f"Async Data process error: {e}")
 
                     await self.async_redis.xack(stream_name, self.consumer_group, message_id)
+                    await self.async_redis.xdel(stream_name, message_id)

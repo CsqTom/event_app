@@ -41,7 +41,8 @@ def run_server(app_cls, config: Optional[Dict[str, Any]], group_name: str):
 
     @app.rpc("image_rpc", ImageRpcRequest, ImageRpcResponse)
     def on_rpc(data):
-        return {"length": len(data["data"])}
+        payload = data.data if isinstance(data, ImageRpcRequest) else data["data"]
+        return {"length": len(payload)}
 
     @app.rpc("get_metrics", MetricsRequest, MetricsResponse)
     def get_metrics(_):

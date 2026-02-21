@@ -8,7 +8,9 @@ use std::sync::{mpsc, Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::event_app_redis::{serialize_publish_data, stream_key, RedisConfig};
+use crate::event_app_redis::{channel_key, serialize_publish_data, RedisConfig};
+use serde::ser::Serializer;
+use serde::Serialize;
 
 pub struct StreamTaskManager {
     #[allow(dead_code)]
@@ -357,11 +359,9 @@ fn publish_error_event(client: &redis::Client, stream_id: &str, error: &str) {
             "error": error
         });
         if let Ok(payload) = serialize_publish_data(data) {
-            let key = stream_key("stream_error");
-            let _ = redis::cmd("XADD")
+            let key = channel_key("stream_error");
+            let _ = redis::cmd("PUBLISH")
                 .arg(&key)
-                .arg("*")
-                .arg("payload")
                 .arg(payload)
                 .query::<()>(&mut conn);
         }
@@ -380,23 +380,53 @@ fn publish_frame_event(
         "publish_frame id={} frame_id={} size={}x{}",
         stream_id, frame_id, width, height
     ));
-    let payload_data = json!({
-        "id": stream_id,
-        "frame_id": frame_id,
-        "width": width,
-        "height": height,
-        "format": "rgb24",
-        "data": STANDARD.encode(data),
-    });
-    if let Ok(payload) = serialize_publish_data(payload_data) {
-        let key = stream_key("image_frame");
-        let _ = redis::cmd("XADD")
+    let payload_data = PublishPayload {
+        data: FramePayload {
+            id: stream_id.to_string(),
+            frame_id,
+            width,
+            height,
+            format: "rgb24".to_string(),
+            data: PickleBytes(data),
+        },
+        need_response: false,
+        request_id: None,
+    };
+    if let Ok(payload) = serde_pickle::to_vec(&payload_data, serde_pickle::SerOptions::new()) {
+        let key = channel_key("image_frame");
+        let _ = redis::cmd("PUBLISH")
             .arg(&key)
-            .arg("*")
-            .arg("payload")
             .arg(payload)
             .query::<()>(&mut *conn);
     }
+}
+
+struct PickleBytes(Vec<u8>);
+
+impl Serialize for PickleBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+#[derive(Serialize)]
+struct FramePayload {
+    id: String,
+    frame_id: u64,
+    width: usize,
+    height: usize,
+    format: String,
+    data: PickleBytes,
+}
+
+#[derive(Serialize)]
+struct PublishPayload {
+    data: FramePayload,
+    need_response: bool,
+    request_id: Option<String>,
 }
 
 fn run_stream_session(

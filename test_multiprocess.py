@@ -30,10 +30,10 @@ def run_server():
     # 2. Register RPC
     @server_app.rpc("test_rpc", TestRpcRequest, TestRpcResponse)
     def handle_rpc(data):
-        logger.info(f"[Server PID {os.getpid()}] RPC processing: {data}")
+        logger.info(f"[Server PID {os.getpid()}] RPC processing: {data.text}")
         # Simulate some processing time
         # time.sleep(0.5)
-        return {"result": f"Processed '{data['text']}' by PID {os.getpid()}"}
+        return {"result": f"Processed '{data.text}' by PID {os.getpid()}"}
 
     logger.info(f"[Server PID {os.getpid()}] Starting event loop...")
     # Blocking run to keep the process alive and listening

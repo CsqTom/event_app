@@ -4,7 +4,7 @@ use redis::streams::StreamReadReply;
 use serde_json::{json, Value};
 use serde_pickle::value::{HashableValue, Value as PickleValue};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -44,6 +44,34 @@ pub struct EventAppRedis {
 
 pub fn stream_key(event_type: &str) -> String {
     format!("event:{}:stream", event_type)
+}
+
+pub fn channel_key(event_type: &str) -> String {
+    format!("event:{}:channel", event_type)
+}
+
+fn event_type_from_channel(channel: &str) -> &str {
+    let prefix = "event:";
+    let suffix = ":channel";
+    if channel.starts_with(prefix) && channel.ends_with(suffix) {
+        return &channel[prefix.len()..channel.len() - suffix.len()];
+    }
+    channel
+}
+
+fn is_timeout_error(err: &redis::RedisError) -> bool {
+    if err.kind() != redis::ErrorKind::IoError {
+        return false;
+    }
+    let message = err.to_string().to_lowercase();
+    message.contains("timed out")
+        || message.contains("timeout")
+        || message.contains("10060")
+        || message.contains("connection attempt failed")
+}
+
+fn is_misconf_error(err: &redis::RedisError) -> bool {
+    err.to_string().contains("MISCONF")
 }
 
 pub fn serialize_data(data: &Value) -> Result<Vec<u8>, String> {
@@ -99,18 +127,57 @@ impl EventAppRedis {
         self.client.get_connection().map_err(|e| e.to_string())
     }
 
-    fn ensure_group(&self, conn: &mut redis::Connection, stream: &str) -> Result<(), String> {
+    fn ensure_group(
+        &self,
+        conn: &mut redis::Connection,
+        stream: &str,
+        start_id: &str,
+        reset_last_id: bool,
+    ) -> Result<(), String> {
         let result: Result<(), redis::RedisError> = redis::cmd("XGROUP")
             .arg("CREATE")
             .arg(stream)
             .arg(&self.group_name)
-            .arg("0")
+            .arg(start_id)
             .arg("MKSTREAM")
             .query(conn);
         if let Err(err) = result {
-            let msg = err.to_string();
-            if !msg.contains("BUSYGROUP") {
-                return Err(msg);
+            if is_misconf_error(&err) {
+                let _ = redis::cmd("CONFIG")
+                    .arg("SET")
+                    .arg("stop-writes-on-bgsave-error")
+                    .arg("no")
+                    .query::<()>(&mut *conn);
+                let retry: Result<(), redis::RedisError> = redis::cmd("XGROUP")
+                    .arg("CREATE")
+                    .arg(stream)
+                    .arg(&self.group_name)
+                    .arg(start_id)
+                    .arg("MKSTREAM")
+                    .query(conn);
+                if let Err(retry_err) = retry {
+                    let msg = retry_err.to_string();
+                    if !msg.contains("BUSYGROUP") {
+                        return Err(msg);
+                    }
+                } else {
+                    return Ok(());
+                }
+            } else {
+                let msg = err.to_string();
+                if !msg.contains("BUSYGROUP") {
+                    return Err(msg);
+                }
+            }
+            if reset_last_id {
+                self.exec_with_retry(conn, |conn| {
+                    redis::cmd("XGROUP")
+                        .arg("SETID")
+                        .arg(stream)
+                        .arg(&self.group_name)
+                        .arg(start_id)
+                        .query::<()>(conn)
+                })?;
             }
         }
         Ok(())
@@ -120,14 +187,13 @@ impl EventAppRedis {
     pub fn publish(&self, event_type: &str, data: Value) -> Result<(), String> {
         let mut conn = self.connection()?;
         let payload = serialize_publish_data(data)?;
-        let stream = stream_key(event_type);
-        redis::cmd("XADD")
-            .arg(stream)
-            .arg("*")
-            .arg("payload")
-            .arg(payload)
-            .query(&mut conn)
-            .map_err(|e| e.to_string())
+        let channel = channel_key(event_type);
+        self.exec_with_retry(&mut conn, |conn| {
+            redis::cmd("PUBLISH")
+                .arg(channel.clone())
+                .arg(payload.clone())
+                .query::<()>(conn)
+        })
     }
 
     #[allow(dead_code)]
@@ -149,13 +215,14 @@ impl EventAppRedis {
         });
         let stream = stream_key(event_type);
         let payload_bytes = serialize_data(&payload)?;
-        redis::cmd("XADD")
-            .arg(stream)
-            .arg("*")
-            .arg("payload")
-            .arg(payload_bytes)
-            .query::<()>(&mut conn)
-            .map_err(|e| e.to_string())?;
+        self.exec_with_retry(&mut conn, |conn| {
+            redis::cmd("XADD")
+                .arg(stream.clone())
+                .arg("*")
+                .arg("payload")
+                .arg(payload_bytes.clone())
+                .query::<()>(conn)
+        })?;
 
         let blpop_timeout = if timeout >= 1.0 { timeout as usize } else { 1 };
         let result: Option<(String, Vec<u8>)> = redis::cmd("BLPOP")
@@ -163,10 +230,9 @@ impl EventAppRedis {
             .arg(blpop_timeout)
             .query(&mut conn)
             .map_err(|e| e.to_string())?;
-        redis::cmd("DEL")
-            .arg(&response_key)
-            .query::<()>(&mut conn)
-            .map_err(|e| e.to_string())?;
+        self.exec_with_retry(&mut conn, |conn| {
+            redis::cmd("DEL").arg(&response_key).query::<()>(conn)
+        })?;
         let payload = match result {
             Some((_, payload)) => payload,
             None => {
@@ -181,23 +247,67 @@ impl EventAppRedis {
     }
 
     pub fn run(&mut self) -> Result<(), String> {
-        let mut conn = self.connection()?;
+        let mut stream_conn = self.connection()?;
+        let mut pubsub_conn = if self.subscribers.is_empty() {
+            None
+        } else {
+            Some(self.connection()?)
+        };
+        if let Some(conn) = pubsub_conn.as_mut() {
+            conn.set_read_timeout(Some(Duration::from_millis(50)))
+                .map_err(|e| e.to_string())?;
+        }
+        let mut pubsub = pubsub_conn.as_mut().map(|conn| conn.as_pubsub());
         let consumer = format!("consumer-{}", Uuid::new_v4());
-        let mut stream_keys: Vec<String> = self
-            .subscribers
-            .keys()
-            .chain(self.rpc_handlers.keys())
-            .map(|s| stream_key(s))
-            .collect();
+        let mut stream_keys: Vec<String> =
+            self.rpc_handlers.keys().map(|s| stream_key(s)).collect();
         stream_keys.sort();
         stream_keys.dedup();
-        if stream_keys.is_empty() {
+        if stream_keys.is_empty() && pubsub.is_none() {
             return Err("no subscribed events".to_string());
         }
+        if let Some(pubsub) = pubsub.as_mut() {
+            let mut channel_keys: Vec<String> = self
+                .subscribers
+                .keys()
+                .map(|s| channel_key(s))
+                .collect();
+            channel_keys.sort();
+            channel_keys.dedup();
+            for channel in channel_keys {
+                pubsub.subscribe(channel).map_err(|e| e.to_string())?;
+            }
+        }
         for key in &stream_keys {
-            self.ensure_group(&mut conn, key)?;
+            self.ensure_group(&mut stream_conn, key, "$", true)?;
         }
         loop {
+            if let Some(pubsub) = pubsub.as_mut() {
+                match pubsub.get_message() {
+                    Ok(message) => {
+                        let channel = message.get_channel_name();
+                        let event_type = event_type_from_channel(channel);
+                        let payload: Vec<u8> = match message.get_payload() {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                let text: String =
+                                    message.get_payload().map_err(|e| e.to_string())?;
+                                text.into_bytes()
+                            }
+                        };
+                        let publish_data = deserialize_data(&payload)?;
+                        self.process_event(event_type, publish_data, &mut stream_conn)?;
+                    }
+                    Err(err) => {
+                        if !is_timeout_error(&err) {
+                            return Err(err.to_string());
+                        }
+                    }
+                }
+            }
+            if stream_keys.is_empty() {
+                continue;
+            }
             let mut cmd = redis::cmd("XREADGROUP");
             cmd.arg("GROUP")
                 .arg(&self.group_name)
@@ -213,7 +323,8 @@ impl EventAppRedis {
             for _ in &stream_keys {
                 cmd.arg(">");
             }
-            let reply: Option<StreamReadReply> = cmd.query(&mut conn).map_err(|e| e.to_string())?;
+            let reply: Option<StreamReadReply> =
+                cmd.query(&mut stream_conn).map_err(|e| e.to_string())?;
             let Some(reply) = reply else {
                 continue;
             };
@@ -224,23 +335,37 @@ impl EventAppRedis {
                     let payload = match payload_value.and_then(redis_value_to_bytes) {
                         Some(payload) => payload,
                         None => {
-                            redis::cmd("XACK")
-                                .arg(&stream.key)
-                                .arg(&self.group_name)
-                                .arg(&id.id)
-                                .query::<()>(&mut conn)
-                                .map_err(|e| e.to_string())?;
+                            self.exec_with_retry(&mut stream_conn, |conn| {
+                                redis::cmd("XACK")
+                                    .arg(&stream.key)
+                                    .arg(&self.group_name)
+                                    .arg(&id.id)
+                                    .query::<()>(conn)
+                            })?;
+                            self.exec_with_retry(&mut stream_conn, |conn| {
+                                redis::cmd("XDEL")
+                                    .arg(&stream.key)
+                                    .arg(&id.id)
+                                    .query::<()>(conn)
+                            })?;
                             continue;
                         }
                     };
                     let publish_data = deserialize_data(&payload)?;
-                    self.process_event(event_type, publish_data, &mut conn)?;
-                    redis::cmd("XACK")
-                        .arg(&stream.key)
-                        .arg(&self.group_name)
-                        .arg(&id.id)
-                        .query::<()>(&mut conn)
-                        .map_err(|e| e.to_string())?;
+                    self.process_event(event_type, publish_data, &mut stream_conn)?;
+                    self.exec_with_retry(&mut stream_conn, |conn| {
+                        redis::cmd("XACK")
+                            .arg(&stream.key)
+                            .arg(&self.group_name)
+                            .arg(&id.id)
+                            .query::<()>(conn)
+                    })?;
+                    self.exec_with_retry(&mut stream_conn, |conn| {
+                        redis::cmd("XDEL")
+                            .arg(&stream.key)
+                            .arg(&id.id)
+                            .query::<()>(conn)
+                    })?;
                 }
             }
         }
@@ -283,32 +408,36 @@ impl EventAppRedis {
                         if let Some(reply_to) = reply_to {
                             let response = json!({"request_id": request_id, "data": result});
                             let payload = serialize_data(&response)?;
-                            redis::cmd("RPUSH")
-                                .arg(&reply_to)
-                                .arg(payload)
-                                .query::<()>(&mut *conn)
-                                .map_err(|e| e.to_string())?;
-                            redis::cmd("EXPIRE")
-                                .arg(&reply_to)
-                                .arg(60)
-                                .query::<()>(&mut *conn)
-                                .map_err(|e| e.to_string())?;
+                            self.exec_with_retry(conn, |conn| {
+                                redis::cmd("RPUSH")
+                                    .arg(&reply_to)
+                                    .arg(payload.clone())
+                                    .query::<()>(conn)
+                            })?;
+                            self.exec_with_retry(conn, |conn| {
+                                redis::cmd("EXPIRE")
+                                    .arg(&reply_to)
+                                    .arg(60)
+                                    .query::<()>(conn)
+                            })?;
                         }
                     }
                     Err(error) => {
                         if let Some(reply_to) = reply_to {
                             let response = json!({"request_id": request_id, "error": error});
                             let payload = serialize_data(&response)?;
-                            redis::cmd("RPUSH")
-                                .arg(&reply_to)
-                                .arg(payload)
-                                .query::<()>(&mut *conn)
-                                .map_err(|e| e.to_string())?;
-                            redis::cmd("EXPIRE")
-                                .arg(&reply_to)
-                                .arg(60)
-                                .query::<()>(&mut *conn)
-                                .map_err(|e| e.to_string())?;
+                            self.exec_with_retry(conn, |conn| {
+                                redis::cmd("RPUSH")
+                                    .arg(&reply_to)
+                                    .arg(payload.clone())
+                                    .query::<()>(conn)
+                            })?;
+                            self.exec_with_retry(conn, |conn| {
+                                redis::cmd("EXPIRE")
+                                    .arg(&reply_to)
+                                    .arg(60)
+                                    .query::<()>(conn)
+                            })?;
                         }
                     }
                 }
@@ -319,6 +448,26 @@ impl EventAppRedis {
             }
         }
         Ok(())
+    }
+
+    fn exec_with_retry<T, F>(&self, conn: &mut redis::Connection, mut op: F) -> Result<T, String>
+    where
+        F: FnMut(&mut redis::Connection) -> Result<T, redis::RedisError>,
+    {
+        match op(conn) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                if is_misconf_error(&err) {
+                    let _ = redis::cmd("CONFIG")
+                        .arg("SET")
+                        .arg("stop-writes-on-bgsave-error")
+                        .arg("no")
+                        .query::<()>(&mut *conn);
+                    return op(conn).map_err(|e| e.to_string());
+                }
+                Err(err.to_string())
+            }
+        }
     }
 }
 

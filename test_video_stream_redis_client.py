@@ -1,6 +1,6 @@
 import time
 import threading
-import queue
+from q_log.log_nb import logger
 from typing import Optional
 
 from pydantic import BaseModel
@@ -13,27 +13,17 @@ class ImageFrame(BaseModel):
     width: int
     height: int
     format: str
-    data: str
+    data: bytes
     processed: Optional[bool] = None
 
 
 def run_client():
     app = EventApp(group_name="video_stream_client")
-    counters = {"received": 0}
-    log_queue: queue.SimpleQueue = queue.SimpleQueue()
 
-    def log_worker():
-        while True:
-            message = log_queue.get()
-            print(message)
-
-    logger_thread = threading.Thread(target=log_worker, daemon=True)
-    logger_thread.start()
 
     @app.subscribe("image_frame", ImageFrame)
     def on_frame(data):
-        counters["received"] += 1
-        log_queue.put(f"{time.time()} on_frame -> {counters['received']}")
+        logger.info(f"{time.time()} on_frame -> frame_id={data.frame_id}")
         if isinstance(data, dict):
             data["processed"] = True
             app.publish("image_frame_processed", data)
@@ -52,9 +42,6 @@ def run_client():
     time.sleep(30)
     close_result = app.get("stream_close", {"id": "stream-001"}, timeout=5.0)
     print(f"stream_close -> {close_result}")
-
-    time.sleep(0.5)
-    print(f"received_frames -> {counters['received']}")
 
 
 if __name__ == "__main__":
