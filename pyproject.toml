@@ -10,4 +10,6 @@ dependencies = [
     "pydantic>=2.7.0",
     "redis>=7.1.0",
     "pyzmq>=26.4.0",
+    "msgpack>=1.0.0",
+    "msgpack-numpy>=0.4.0",
 ]

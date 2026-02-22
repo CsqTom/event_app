@@ -5,6 +5,7 @@ import asyncio
 import multiprocessing
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional, Dict, List, Union
 import numpy as np
 
@@ -12,22 +13,35 @@ import redis
 import redis.asyncio as async_redis
 from pydantic import BaseModel, ValidationError
 
-# -------------------------- 基础配置 & 工具函数 --------------------------
+try:
+    import msgpack
+    import msgpack_numpy as m
+    m.patch()
+    HAS_MSGPACK = True
+except ImportError:
+    HAS_MSGPACK = False
+
 DEFAULT_REDIS_CONFIG = {
     "host": "127.0.0.1",
-    "port": 6379,
+    "port": 6380,
     "db": 0,
     "decode_responses": False
 }
 
+SERIALIZATION_MSGPACK = "msgpack"
+SERIALIZATION_PICKLE = "pickle"
+DEFAULT_SERIALIZATION = SERIALIZATION_MSGPACK if HAS_MSGPACK else SERIALIZATION_PICKLE
 
-def serialize_data(data: Any) -> bytes:
-    """序列化（支持numpy.ndarray）"""
+
+def serialize_data(data: Any, method: str = DEFAULT_SERIALIZATION) -> bytes:
+    if method == SERIALIZATION_MSGPACK and HAS_MSGPACK:
+        return msgpack.packb(data, use_bin_type=True)
     return pickle.dumps(data)
 
 
-def deserialize_data(data_bytes: bytes) -> Any:
-    """反序列化"""
+def deserialize_data(data_bytes: bytes, method: str = DEFAULT_SERIALIZATION) -> Any:
+    if method == SERIALIZATION_MSGPACK and HAS_MSGPACK:
+        return msgpack.unpackb(data_bytes, raw=False)
     return pickle.loads(data_bytes)
 
 
@@ -35,9 +49,7 @@ class EventSchemaError(ValueError):
     pass
 
 
-# -------------------------- Redis 连接管理 --------------------------
 class SyncRedisClient:
-    """同步Redis单例客户端"""
     _instance: Optional[redis.Redis] = None
 
     @classmethod
@@ -48,7 +60,6 @@ class SyncRedisClient:
 
 
 class AsyncRedisClient:
-    """异步Redis单例客户端"""
     _instance: Optional[async_redis.Redis] = None
 
     @classmethod
@@ -58,20 +69,25 @@ class AsyncRedisClient:
         return cls._instance
 
 
-# -------------------------- 核心 EventApp 类 --------------------------
 class EventApp:
-    """
-    对于group_name：参见EVENT_REDIS_GROUP_NAME_GUIDE.md说明，或是网上搜 redis consumer_group 相关资料
-    """
-
-    def __init__(self, redis_config: dict = None, group_name: str = "event_app_group"):
+    def __init__(
+        self,
+        redis_config: dict = None,
+        group_name: str = "event_app_group",
+        serialization: str = DEFAULT_SERIALIZATION,
+        max_workers: int = 4,
+        batch_size: int = 10,
+        block_timeout_ms: int = 50,
+    ):
         self.redis_config = redis_config or DEFAULT_REDIS_CONFIG
-        # 订阅者：{ event_type: [func1, func2, ...] }
+        self.serialization = serialization
+        self.max_workers = max_workers
+        self.batch_size = batch_size
+        self.block_timeout_ms = block_timeout_ms
+
         self.subscribers: Dict[str, List[Callable]] = {}
-        # RPC处理器：{ event_type: func }
         self.rpc_handlers: Dict[str, Callable] = {}
 
-        # Redis 客户端实例
         self.sync_redis: Optional[redis.Redis] = None
         self.async_redis: Optional[async_redis.Redis] = None
         self.consumer_group = group_name
@@ -81,10 +97,20 @@ class EventApp:
         self._event_specs: Dict[str, Dict[str, Any]] = {}
         self._rpc_specs: Dict[str, Dict[str, Any]] = {}
 
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._pubsub_thread: Optional[threading.Thread] = None
+        self._stream_thread: Optional[threading.Thread] = None
+        self._running = threading.Event()
+        self._running.set()
+
     def _init_sync_redis(self):
         if self.sync_redis is None:
-            # 初始化同步Redis连接, 耗时10-20ms左右
             self.sync_redis = SyncRedisClient.get_instance(self.redis_config)
+
+    def _get_executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        return self._executor
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -93,6 +119,9 @@ class EventApp:
         state['_publish_queue'] = None
         state['_publish_thread'] = None
         state['_handler_local'] = None
+        state['_executor'] = None
+        state['_pubsub_thread'] = None
+        state['_stream_thread'] = None
         return state
 
     def __setstate__(self, state):
@@ -102,6 +131,8 @@ class EventApp:
         self._publish_thread = None
         if self.__dict__.get("_handler_local") is None:
             self._handler_local = threading.local()
+        self._running = threading.Event()
+        self._running.set()
 
     def _in_handler(self) -> bool:
         return getattr(self._handler_local, "active", False)
@@ -198,10 +229,6 @@ class EventApp:
                 self.sync_redis.xgroup_setid(stream_key, self.consumer_group, start_id)
 
     def subscribe(self, event_type: str, model: type[BaseModel]):
-        """
-        订阅装饰器（异步，多订阅）
-        支持多个函数订阅同一个事件
-        """
         model = self._ensure_model(model, "event")
         existing = self._event_specs.get(event_type)
         if existing and existing.get("model") is not model:
@@ -217,10 +244,6 @@ class EventApp:
         return decorator
 
     def rpc(self, event_type: str, request_model: type[BaseModel], response_model: type[BaseModel]):
-        """
-        RPC装饰器（同步，请求-响应）
-        每个事件类型通常只有一个RPC处理器
-        """
         request_model = self._ensure_model(request_model, "request")
         response_model = self._ensure_model(response_model, "response")
         existing = self._rpc_specs.get(event_type)
@@ -236,9 +259,6 @@ class EventApp:
         return decorator
 
     def publish(self, event_type: str, data: Any) -> None:
-        """
-        发布事件（异步/Fire-and-Forget）
-        """
         self._validate_event_payload(event_type, data)
         data = self._normalize_payload(data)
         if self._in_handler():
@@ -253,7 +273,7 @@ class EventApp:
         }
 
         channel_key = self._channel_key(event_type)
-        self.sync_redis.publish(channel_key, serialize_data(publish_data))
+        self.sync_redis.publish(channel_key, serialize_data(publish_data, self.serialization))
 
     def _publish_worker(self):
         while True:
@@ -306,9 +326,6 @@ class EventApp:
                 await self._publish_from_handler_async(item)
 
     def get(self, event_type: str, data: Any, timeout: float = 10.0) -> Any:
-        """
-        RPC调用（同步/Request-Response）
-        """
         self._init_sync_redis()
         self._validate_rpc_request(event_type, data)
         data = self._normalize_payload(data)
@@ -327,33 +344,25 @@ class EventApp:
 
         stream_key = self._stream_key(event_type)
 
-        # 发送请求
-        self.sync_redis.xadd(stream_key, {"payload": serialize_data(publish_data)})
+        self.sync_redis.xadd(stream_key, {"payload": serialize_data(publish_data, self.serialization)})
 
-        # 阻塞等待响应 (BLPOP)
-        # Redis BLPOP timeout must be an integer
         blpop_timeout = int(timeout) if timeout >= 1 else 1
 
         try:
-            # blpop 返回 (key, value) 元组
             result_tuple = self.sync_redis.blpop(response_key, timeout=blpop_timeout)
         except redis.exceptions.TimeoutError:
-            # redis-py 的 blpop 在超时时可能抛出异常或返回 None，取决于版本
             result_tuple = None
 
         if not result_tuple:
-            # 清理（虽然可能没数据）
             self.sync_redis.delete(response_key)
             raise TimeoutError(f"RPC调用 {event_type} 超时（{timeout}s）")
 
         _, payload = result_tuple
 
-        # 清理响应队列
         self.sync_redis.delete(response_key)
 
-        result_data = deserialize_data(payload)
+        result_data = deserialize_data(payload, self.serialization)
 
-        # 结果结构: {"request_id": ..., "data": ...}
         if isinstance(result_data, dict) and "error" in result_data:
             raise RuntimeError(f"RPC Remote Error: {result_data['error']}")
         result = result_data.get("data")
@@ -361,9 +370,6 @@ class EventApp:
         return result
 
     async def publish_async(self, event_type: str, data: Any) -> None:
-        """
-        异步发布事件
-        """
         self._validate_event_payload(event_type, data)
         if self._in_handler():
             self._enqueue_publish(event_type, data)
@@ -379,12 +385,9 @@ class EventApp:
         }
 
         channel_key = self._channel_key(event_type)
-        await self.async_redis.publish(channel_key, serialize_data(publish_data))
+        await self.async_redis.publish(channel_key, serialize_data(publish_data, self.serialization))
 
     async def get_async(self, event_type: str, data: Any, timeout: float = 10.0) -> Any:
-        """
-        异步RPC调用
-        """
         if self.async_redis is None:
             self.async_redis = await AsyncRedisClient.get_instance(self.redis_config)
         self._validate_rpc_request(event_type, data)
@@ -404,9 +407,8 @@ class EventApp:
 
         stream_key = self._stream_key(event_type)
 
-        await self.async_redis.xadd(stream_key, {"payload": serialize_data(publish_data)})
+        await self.async_redis.xadd(stream_key, {"payload": serialize_data(publish_data, self.serialization)})
 
-        # 异步 BLPOP
         blpop_timeout = int(timeout) if timeout >= 1 else 1
         try:
             result_tuple = await self.async_redis.blpop(response_key, timeout=blpop_timeout)
@@ -421,7 +423,7 @@ class EventApp:
 
         await self.async_redis.delete(response_key)
 
-        result_data = deserialize_data(payload)
+        result_data = deserialize_data(payload, self.serialization)
 
         if isinstance(result_data, dict) and "error" in result_data:
             raise RuntimeError(f"Async RPC Remote Error: {result_data['error']}")
@@ -430,7 +432,6 @@ class EventApp:
         return result
 
     def _process_event(self, event_type: str, publish_data: dict):
-        """处理收到的事件"""
         data = publish_data["data"]
         need_response = publish_data.get("need_response", False)
         request_id = publish_data.get("request_id")
@@ -443,20 +444,18 @@ class EventApp:
                 if reply_to:
                     self.sync_redis.rpush(
                         reply_to,
-                        serialize_data({"request_id": request_id, "error": str(e)}),
+                        serialize_data({"request_id": request_id, "error": str(e)}, self.serialization),
                     )
                     self.sync_redis.expire(reply_to, 60)
                 return
-            # Server-side timeout check
             timestamp = publish_data.get("timestamp")
             timeout = publish_data.get("timeout")
 
             if timestamp and timeout:
                 if time.time() - timestamp > timeout:
                     print(f"RPC请求 {event_type} (ID: {request_id}) 已超时，丢弃处理")
-                    return  # Skip processing and response
+                    return
 
-            # RPC 处理
             if event_type in self.rpc_handlers:
                 try:
                     handler = self.rpc_handlers[event_type]
@@ -466,20 +465,18 @@ class EventApp:
                     finally:
                         self._handler_local.active = False
                     self._validate_rpc_response(event_type, result)
-                    # 发送响应 (List Push)
                     if reply_to:
                         normalized = self._normalize_payload(result)
-                        self.sync_redis.rpush(reply_to, serialize_data({"request_id": request_id, "data": normalized}))
-                        self.sync_redis.expire(reply_to, 60)  # 1分钟过期，防止残留
+                        self.sync_redis.rpush(reply_to, serialize_data({"request_id": request_id, "data": normalized}, self.serialization))
+                        self.sync_redis.expire(reply_to, 60)
                 except Exception as e:
                     print(f"RPC {event_type} 处理失败: {e}")
                     if reply_to:
-                        self.sync_redis.rpush(reply_to, serialize_data({"request_id": request_id, "error": str(e)}))
+                        self.sync_redis.rpush(reply_to, serialize_data({"request_id": request_id, "error": str(e)}, self.serialization))
                         self.sync_redis.expire(reply_to, 60)
             else:
                 print(f"收到RPC请求 {event_type} 但无处理器")
         else:
-            # 订阅 处理
             if event_type in self.subscribers:
                 try:
                     self._validate_event_payload(event_type, data)
@@ -497,12 +494,16 @@ class EventApp:
                     except Exception as e:
                         print(f"订阅处理器 {handler.__name__} 处理 {event_type} 失败: {e}")
             else:
-                # 只有在既不是RPC也不是订阅时才提示，或者忽略
                 if event_type not in self.rpc_handlers:
-                    print(f"无事件 {event_type} 的订阅者或RPC处理器，跳过")
+                    pass
+
+    def _process_event_async_wrapper(self, event_type: str, publish_data: dict):
+        try:
+            self._process_event(event_type, publish_data)
+        except Exception as e:
+            print(f"事件处理异常: {e}")
 
     async def _process_event_async(self, event_type: str, publish_data: dict):
-        """异步处理事件"""
         data = publish_data["data"]
         need_response = publish_data.get("need_response", False)
         request_id = publish_data.get("request_id")
@@ -515,18 +516,17 @@ class EventApp:
                 if reply_to:
                     await self.async_redis.rpush(
                         reply_to,
-                        serialize_data({"request_id": request_id, "error": str(e)}),
+                        serialize_data({"request_id": request_id, "error": str(e)}, self.serialization),
                     )
                     await self.async_redis.expire(reply_to, 60)
                 return
-            # Server-side timeout check
             timestamp = publish_data.get("timestamp")
             timeout = publish_data.get("timeout")
 
             if timestamp and timeout:
                 if time.time() - timestamp > timeout:
                     print(f"Async RPC请求 {event_type} (ID: {request_id}) 已超时，丢弃处理")
-                    return  # Skip processing and response
+                    return
 
             if event_type in self.rpc_handlers:
                 try:
@@ -543,13 +543,13 @@ class EventApp:
                     if reply_to:
                         normalized = self._normalize_payload(result)
                         await self.async_redis.rpush(reply_to,
-                                                     serialize_data({"request_id": request_id, "data": normalized}))
+                                                     serialize_data({"request_id": request_id, "data": normalized}, self.serialization))
                         await self.async_redis.expire(reply_to, 60)
                 except Exception as e:
                     print(f"Async RPC {event_type} 处理失败: {e}")
                     if reply_to:
                         await self.async_redis.rpush(reply_to,
-                                                     serialize_data({"request_id": request_id, "error": str(e)}))
+                                                     serialize_data({"request_id": request_id, "error": str(e)}, self.serialization))
                         await self.async_redis.expire(reply_to, 60)
         else:
             if event_type in self.subscribers:
@@ -572,20 +572,48 @@ class EventApp:
                     except Exception as e:
                         print(f"Async 订阅处理器 {handler.__name__} 处理 {event_type} 失败: {e}")
 
-    def _listen_loop(self):
-        """监听循环，运行在子进程或主线程"""
+    def _pubsub_listen_loop(self):
         if self.sync_redis is None:
             self.sync_redis = SyncRedisClient.get_instance(self.redis_config)
 
-        channel_keys = []
-        if self.subscribers:
-            channel_keys = [self._channel_key(event_type) for event_type in self.subscribers.keys()]
-            pubsub = self.sync_redis.pubsub(ignore_subscribe_messages=True)
-            pubsub.subscribe(*channel_keys)
-        else:
-            pubsub = None
+        channel_keys = [self._channel_key(event_type) for event_type in self.subscribers.keys()]
+        if not channel_keys:
+            return
 
-        # 重新收集 RPC 流
+        pubsub = self.sync_redis.pubsub(ignore_subscribe_messages=True)
+        pubsub.subscribe(*channel_keys)
+
+        print(f"[PubSub] 监听已启动，订阅: {list(self.subscribers.keys())}")
+
+        executor = self._get_executor()
+        futures = []
+
+        while self._running.is_set():
+            try:
+                message = pubsub.get_message(timeout=0.1)
+                if message and message.get("type") == "message":
+                    channel = message.get("channel")
+                    payload = message.get("data")
+                    event_type = self._event_type_from_channel(channel)
+                    if payload:
+                        try:
+                            publish_data = deserialize_data(payload, self.serialization)
+                            future = executor.submit(self._process_event_async_wrapper, event_type, publish_data)
+                            futures.append(future)
+                        except Exception as e:
+                            print(f"PubSub Data process error: {e}")
+
+                futures = [f for f in futures if not f.done()]
+            except Exception as e:
+                print(f"PubSub loop error: {e}")
+
+        pubsub.unsubscribe()
+        pubsub.close()
+
+    def _stream_listen_loop(self):
+        if self.sync_redis is None:
+            self.sync_redis = SyncRedisClient.get_instance(self.redis_config)
+
         all_events = set(self.rpc_handlers.keys())
         stream_keys = []
         for event_type in all_events:
@@ -593,41 +621,31 @@ class EventApp:
             stream_keys.append(stream_key)
             self._ensure_group(stream_key, start_id="$", reset_last_id=True)
 
-        print(f"事件监听已启动 (PID: {multiprocessing.current_process().pid})，订阅: {list(self.subscribers.keys())}，RPC: {list(all_events)}")
+        if not stream_keys:
+            return
+
+        print(f"[Stream] 监听已启动，RPC: {list(all_events)}")
 
         consumer_name = f"consumer-{multiprocessing.current_process().pid}"
-        while True:
-            pubsub_timeout = 0.05 if stream_keys else 0.001
-            if pubsub is not None:
-                message = pubsub.get_message(timeout=pubsub_timeout)
-                if message and message.get("type") == "message":
-                    channel = message.get("channel")
-                    payload = message.get("data")
-                    event_type = self._event_type_from_channel(channel)
-                    if payload:
-                        try:
-                            publish_data = deserialize_data(payload)
-                            self._process_event(event_type, publish_data)
-                        except Exception as e:
-                            print(f"PubSub Data process error: {e}")
+        executor = self._get_executor()
+        futures = []
 
-            if not stream_keys:
-                if pubsub is None:
-                    time.sleep(0.05)
-                continue
-
+        while self._running.is_set():
             streams = {key: ">" for key in stream_keys}
             try:
                 messages = self.sync_redis.xreadgroup(
                     self.consumer_group,
                     consumer_name,
                     streams,
-                    count=1,
-                    block=50
+                    count=self.batch_size,
+                    block=self.block_timeout_ms
                 )
             except redis.exceptions.ResponseError as e:
                 print(f"Redis Read Error: {e}")
                 time.sleep(1)
+                continue
+
+            if not messages:
                 continue
 
             for stream_key, entries in messages:
@@ -644,25 +662,48 @@ class EventApp:
                         continue
 
                     try:
-                        publish_data = deserialize_data(payload)
-                        self._process_event(event_type, publish_data)
+                        publish_data = deserialize_data(payload, self.serialization)
+                        future = executor.submit(self._process_event_async_wrapper, event_type, publish_data)
+                        futures.append(future)
                     except Exception as e:
                         print(f"Data process error: {e}")
 
                     self.sync_redis.xack(stream_name, self.consumer_group, message_id)
                     self.sync_redis.xdel(stream_name, message_id)
 
+            futures = [f for f in futures if not f.done()]
+
+    def _listen_loop(self):
+        self._init_sync_redis()
+
+        has_pubsub = bool(self.subscribers)
+        has_stream = bool(self.rpc_handlers)
+
+        if has_pubsub and has_stream:
+            self._pubsub_thread = threading.Thread(target=self._pubsub_listen_loop, daemon=True)
+            self._pubsub_thread.start()
+
+            self._stream_listen_loop()
+        elif has_pubsub:
+            self._pubsub_listen_loop()
+        elif has_stream:
+            self._stream_listen_loop()
+        else:
+            print("无订阅者或RPC处理器，监听未启动")
+
     def run(self, block: bool = True):
-        """启动监听"""
         if block:
             self._listen_loop()
         else:
-            listener_thread = multiprocessing.Process(target=self._listen_loop)
-            listener_thread.daemon = True
+            listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
             listener_thread.start()
 
+    def stop(self):
+        self._running.clear()
+        if self._executor:
+            self._executor.shutdown(wait=False)
+
     async def run_async(self):
-        """启动异步监听"""
         if self.async_redis is None:
             self.async_redis = await AsyncRedisClient.get_instance(self.redis_config)
 
@@ -684,7 +725,7 @@ class EventApp:
                 if not payload:
                     continue
                 try:
-                    publish_data = deserialize_data(payload)
+                    publish_data = deserialize_data(payload, self.serialization)
                     await self._process_event_async(event_type, publish_data)
                 except Exception as e:
                     print(f"Async PubSub Data process error: {e}")
@@ -718,8 +759,8 @@ class EventApp:
                     self.consumer_group,
                     consumer_name,
                     streams,
-                    count=1,
-                    block=50
+                    count=self.batch_size,
+                    block=self.block_timeout_ms
                 )
             except redis.exceptions.ResponseError as e:
                 print(f"Async Redis Read Error: {e}")
@@ -740,7 +781,7 @@ class EventApp:
                         continue
 
                     try:
-                        publish_data = deserialize_data(payload)
+                        publish_data = deserialize_data(payload, self.serialization)
                         await self._process_event_async(event_type, publish_data)
                     except Exception as e:
                         print(f"Async Data process error: {e}")

@@ -7,6 +7,18 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Serialization {
+    MsgPack,
+    Pickle,
+}
+
+impl Default for Serialization {
+    fn default() -> Self {
+        Serialization::MsgPack
+    }
+}
+
 #[derive(Clone)]
 pub struct RedisConfig {
     pub host: String,
@@ -18,7 +30,7 @@ impl Default for RedisConfig {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
-            port: 6379,
+            port: 6380,
             db: 0,
         }
     }
@@ -40,6 +52,7 @@ pub struct EventAppRedis {
     subscribers: HashMap<String, Vec<SubHandler>>,
     rpc_handlers: HashMap<String, RpcHandler>,
     client: redis::Client,
+    serialization: Serialization,
 }
 
 pub fn stream_key(event_type: &str) -> String {
@@ -74,24 +87,86 @@ fn is_misconf_error(err: &redis::RedisError) -> bool {
     err.to_string().contains("MISCONF")
 }
 
-pub fn serialize_data(data: &Value) -> Result<Vec<u8>, String> {
-    serde_pickle::to_vec(data, serde_pickle::SerOptions::new()).map_err(|e| e.to_string())
+pub fn serialize_data(data: &Value, serialization: Serialization) -> Result<Vec<u8>, String> {
+    match serialization {
+        Serialization::MsgPack => serialize_msgpack(data),
+        Serialization::Pickle => {
+            serde_pickle::to_vec(data, serde_pickle::SerOptions::new()).map_err(|e| e.to_string())
+        }
+    }
 }
 
-pub fn deserialize_data(payload: &[u8]) -> Result<Value, String> {
-    let value: PickleValue =
-        serde_pickle::from_slice(payload, serde_pickle::DeOptions::new())
-            .map_err(|e| e.to_string())?;
-    Ok(pickle_to_json(value))
+pub fn deserialize_data(payload: &[u8], serialization: Serialization) -> Result<Value, String> {
+    match serialization {
+        Serialization::MsgPack => deserialize_msgpack(payload),
+        Serialization::Pickle => {
+            let value: PickleValue =
+                serde_pickle::from_slice(payload, serde_pickle::DeOptions::new())
+                    .map_err(|e| e.to_string())?;
+            Ok(pickle_to_json(value))
+        }
+    }
 }
 
-pub fn serialize_publish_data(data: Value) -> Result<Vec<u8>, String> {
+fn serialize_msgpack(data: &Value) -> Result<Vec<u8>, String> {
+    rmp_serde::to_vec(data).map_err(|e| e.to_string())
+}
+
+fn deserialize_msgpack(payload: &[u8]) -> Result<Value, String> {
+    let v: rmpv::Value = rmpv::decode::read_value(&mut &payload[..]).map_err(|e| e.to_string())?;
+    Ok(msgpack_to_json(v))
+}
+
+fn msgpack_to_json(value: rmpv::Value) -> Value {
+    match value {
+        rmpv::Value::Nil => Value::Null,
+        rmpv::Value::Boolean(v) => Value::Bool(v),
+        rmpv::Value::Integer(v) => {
+            if let Some(i) = v.as_i64() {
+                json!(i)
+            } else if let Some(u) = v.as_u64() {
+                json!(u)
+            } else {
+                Value::Null
+            }
+        }
+        rmpv::Value::F32(v) => json!(v),
+        rmpv::Value::F64(v) => json!(v),
+        rmpv::Value::String(s) => Value::String(s.into_str().unwrap_or_default()),
+        rmpv::Value::Binary(bytes) => Value::String(STANDARD.encode(&bytes)),
+        rmpv::Value::Array(items) => {
+            Value::Array(items.into_iter().map(msgpack_to_json).collect())
+        }
+        rmpv::Value::Map(items) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in items {
+                let key = msgpack_key_to_string(k);
+                map.insert(key, msgpack_to_json(v));
+            }
+            Value::Object(map)
+        }
+        rmpv::Value::Ext(_, _) => Value::Null,
+    }
+}
+
+fn msgpack_key_to_string(value: rmpv::Value) -> String {
+    match value {
+        rmpv::Value::String(s) => s.into_str().unwrap_or_default(),
+        rmpv::Value::Integer(v) => v.as_i64().unwrap_or(0).to_string(),
+        rmpv::Value::Boolean(v) => v.to_string(),
+        rmpv::Value::F64(v) => v.to_string(),
+        rmpv::Value::F32(v) => v.to_string(),
+        _ => "key".to_string(),
+    }
+}
+
+pub fn serialize_publish_data(data: Value, serialization: Serialization) -> Result<Vec<u8>, String> {
     let payload = json!({
         "data": data,
         "need_response": false,
         "request_id": Value::Null
     });
-    serialize_data(&payload)
+    serialize_data(&payload, serialization)
 }
 
 impl EventAppRedis {
@@ -104,7 +179,17 @@ impl EventAppRedis {
             subscribers: HashMap::new(),
             rpc_handlers: HashMap::new(),
             client,
+            serialization: Serialization::MsgPack,
         })
+    }
+
+    pub fn with_serialization(mut self, serialization: Serialization) -> Self {
+        self.serialization = serialization;
+        self
+    }
+
+    pub fn set_serialization(&mut self, serialization: Serialization) {
+        self.serialization = serialization;
     }
 
     pub fn subscribe<F>(&mut self, event_type: &str, handler: F)
@@ -186,7 +271,7 @@ impl EventAppRedis {
     #[allow(dead_code)]
     pub fn publish(&self, event_type: &str, data: Value) -> Result<(), String> {
         let mut conn = self.connection()?;
-        let payload = serialize_publish_data(data)?;
+        let payload = serialize_publish_data(data, self.serialization)?;
         let channel = channel_key(event_type);
         self.exec_with_retry(&mut conn, |conn| {
             redis::cmd("PUBLISH")
@@ -214,7 +299,7 @@ impl EventAppRedis {
             "timeout": timeout
         });
         let stream = stream_key(event_type);
-        let payload_bytes = serialize_data(&payload)?;
+        let payload_bytes = serialize_data(&payload, self.serialization)?;
         self.exec_with_retry(&mut conn, |conn| {
             redis::cmd("XADD")
                 .arg(stream.clone())
@@ -239,7 +324,7 @@ impl EventAppRedis {
                 return Err(format!("RPC调用 {} 超时（{}s）", event_type, timeout));
             }
         };
-        let response = deserialize_data(&payload)?;
+        let response = deserialize_data(&payload, self.serialization)?;
         if let Some(error) = response.get("error").and_then(|v| v.as_str()) {
             return Err(format!("RPC Remote Error: {}", error));
         }
@@ -295,7 +380,10 @@ impl EventAppRedis {
                                 text.into_bytes()
                             }
                         };
-                        let publish_data = deserialize_data(&payload)?;
+                        let publish_data = match deserialize_data(&payload, self.serialization) {
+                            Ok(data) => data,
+                            Err(_) => deserialize_data(&payload, Serialization::Pickle)?,
+                        };
                         self.process_event(event_type, publish_data, &mut stream_conn)?;
                     }
                     Err(err) => {
@@ -315,7 +403,7 @@ impl EventAppRedis {
                 .arg("BLOCK")
                 .arg(50)
                 .arg("COUNT")
-                .arg(1)
+                .arg(10)
                 .arg("STREAMS");
             for key in &stream_keys {
                 cmd.arg(key);
@@ -351,7 +439,10 @@ impl EventAppRedis {
                             continue;
                         }
                     };
-                    let publish_data = deserialize_data(&payload)?;
+                    let publish_data = match deserialize_data(&payload, self.serialization) {
+                        Ok(data) => data,
+                        Err(_) => deserialize_data(&payload, Serialization::Pickle)?,
+                    };
                     self.process_event(event_type, publish_data, &mut stream_conn)?;
                     self.exec_with_retry(&mut stream_conn, |conn| {
                         redis::cmd("XACK")
@@ -407,7 +498,7 @@ impl EventAppRedis {
                     Ok(result) => {
                         if let Some(reply_to) = reply_to {
                             let response = json!({"request_id": request_id, "data": result});
-                            let payload = serialize_data(&response)?;
+                            let payload = serialize_data(&response, self.serialization)?;
                             self.exec_with_retry(conn, |conn| {
                                 redis::cmd("RPUSH")
                                     .arg(&reply_to)
@@ -425,7 +516,7 @@ impl EventAppRedis {
                     Err(error) => {
                         if let Some(reply_to) = reply_to {
                             let response = json!({"request_id": request_id, "error": error});
-                            let payload = serialize_data(&response)?;
+                            let payload = serialize_data(&response, self.serialization)?;
                             self.exec_with_retry(conn, |conn| {
                                 redis::cmd("RPUSH")
                                     .arg(&reply_to)

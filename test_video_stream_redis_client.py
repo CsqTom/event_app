@@ -18,8 +18,12 @@ class ImageFrame(BaseModel):
 
 
 def run_client():
-    app = EventApp(group_name="video_stream_client")
-
+    app = EventApp(
+        group_name="video_stream_client",
+        max_workers=4,
+        batch_size=10,
+        block_timeout_ms=50,
+    )
 
     @app.subscribe("image_frame", ImageFrame)
     def on_frame(data):
@@ -27,6 +31,8 @@ def run_client():
         if isinstance(data, dict):
             data["processed"] = True
             app.publish("image_frame_processed", data)
+        else:
+            app.publish("image_frame_processed", {"id": data.id, "frame_id": data.frame_id, "processed": True})
 
     listener_thread = threading.Thread(target=app._listen_loop, daemon=True)
     listener_thread.start()
@@ -39,9 +45,12 @@ def run_client():
     )
     print(f"stream_open -> {open_result}")
 
-    time.sleep(30)
+    time.sleep(10)
     close_result = app.get("stream_close", {"id": "stream-001"}, timeout=5.0)
     print(f"stream_close -> {close_result}")
+
+    time.sleep(3)
+    app.stop()
 
 
 if __name__ == "__main__":
