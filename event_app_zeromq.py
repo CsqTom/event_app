@@ -7,11 +7,20 @@ import asyncio
 import multiprocessing
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional, Dict, List
 
 import zmq
 import zmq.asyncio as async_zmq
 from pydantic import BaseModel, ValidationError
+
+try:
+    import msgpack
+    import msgpack_numpy as m
+    m.patch()
+    HAS_MSGPACK = True
+except ImportError:
+    HAS_MSGPACK = False
 
 def _ipc_endpoint(name: str) -> str:
     path = os.path.join(tempfile.gettempdir(), name)
@@ -44,11 +53,20 @@ def _cleanup_ipc(endpoint: str):
         pass
 
 
-def serialize_data(data: Any) -> bytes:
+SERIALIZATION_MSGPACK = "msgpack"
+SERIALIZATION_PICKLE = "pickle"
+DEFAULT_SERIALIZATION = SERIALIZATION_MSGPACK if HAS_MSGPACK else SERIALIZATION_PICKLE
+
+
+def serialize_data(data: Any, method: str = DEFAULT_SERIALIZATION) -> bytes:
+    if method == SERIALIZATION_MSGPACK and HAS_MSGPACK:
+        return msgpack.packb(data, use_bin_type=True)
     return pickle.dumps(data)
 
 
-def deserialize_data(data_bytes: bytes) -> Any:
+def deserialize_data(data_bytes: bytes, method: str = DEFAULT_SERIALIZATION) -> Any:
+    if method == SERIALIZATION_MSGPACK and HAS_MSGPACK:
+        return msgpack.unpackb(data_bytes, raw=False)
     return pickle.loads(data_bytes)
 
 
@@ -57,15 +75,21 @@ class EventSchemaError(ValueError):
 
 
 class EventApp:
-    def __new__(cls, redis_config: dict = None, group_name: str = "event_app_group"):
-        if os.name == "nt" and redis_config is None:
-            from event_app_redis import EventApp as RedisEventApp
+    def __init__(
+        self,
+        zmq_config: dict = None,
+        group_name: str = "event_app_group",
+        serialization: str = DEFAULT_SERIALIZATION,
+        max_workers: int = 4,
+        batch_size: int = 10,
+        block_timeout_ms: int = 50,
+    ):
+        self.zmq_config = zmq_config or DEFAULT_ZMQ_CONFIG
+        self.serialization = serialization
+        self.max_workers = max_workers
+        self.batch_size = batch_size
+        self.block_timeout_ms = block_timeout_ms
 
-            return RedisEventApp(redis_config=None, group_name=group_name)
-        return super().__new__(cls)
-
-    def __init__(self, redis_config: dict = None, group_name: str = "event_app_group"):
-        self.zmq_config = redis_config or DEFAULT_ZMQ_CONFIG
         self.subscribers: Dict[str, List[Callable]] = {}
         self.rpc_handlers: Dict[str, Callable] = {}
         self.group_name = group_name
@@ -87,6 +111,10 @@ class EventApp:
         self._async_rpc_rep: Optional[async_zmq.Socket] = None
         self._async_rpc_req: Optional[async_zmq.Socket] = None
 
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._running = threading.Event()
+        self._running.set()
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_context"] = None
@@ -102,6 +130,7 @@ class EventApp:
         state["_publish_queue"] = None
         state["_publish_thread"] = None
         state["_handler_local"] = None
+        state["_executor"] = None
         return state
 
     def __setstate__(self, state):
@@ -111,6 +140,13 @@ class EventApp:
         self._publish_thread = None
         if self.__dict__.get("_handler_local") is None:
             self._handler_local = threading.local()
+        self._running = threading.Event()
+        self._running.set()
+
+    def _get_executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        return self._executor
 
     def _in_handler(self) -> bool:
         return getattr(self._handler_local, "active", False)
@@ -271,7 +307,7 @@ class EventApp:
             "request_id": None
         }
         socket = self._get_event_push()
-        socket.send(serialize_data(publish_data))
+        socket.send(serialize_data(publish_data, self.serialization))
 
     def _publish_worker(self):
         while True:
@@ -336,7 +372,7 @@ class EventApp:
             "timeout": timeout
         }
         socket = self._get_rpc_req()
-        socket.send(serialize_data(publish_data))
+        socket.send(serialize_data(publish_data, self.serialization))
         poller = zmq.Poller()
         poller.register(socket, zmq.POLLIN)
         timeout_ms = int(max(timeout, 1) * 1000)
@@ -344,7 +380,7 @@ class EventApp:
         if socket not in events:
             raise TimeoutError(f"RPC调用 {event_type} 超时（{timeout}s）")
         payload = socket.recv()
-        result_data = deserialize_data(payload)
+        result_data = deserialize_data(payload, self.serialization)
         if isinstance(result_data, dict) and "error" in result_data:
             raise RuntimeError(f"RPC Remote Error: {result_data['error']}")
         result = result_data.get("data")
@@ -361,7 +397,7 @@ class EventApp:
             "request_id": None
         }
         socket = self._get_async_event_push()
-        await socket.send(serialize_data(publish_data))
+        await socket.send(serialize_data(publish_data, self.serialization))
 
     async def get_async(self, event_type: str, data: Any, timeout: float = 10.0) -> Any:
         self._validate_rpc_request(event_type, data)
@@ -376,7 +412,7 @@ class EventApp:
             "timeout": timeout
         }
         socket = self._get_async_rpc_req()
-        await socket.send(serialize_data(publish_data))
+        await socket.send(serialize_data(publish_data, self.serialization))
         poller = async_zmq.Poller()
         poller.register(socket, zmq.POLLIN)
         timeout_ms = int(max(timeout, 1) * 1000)
@@ -384,7 +420,7 @@ class EventApp:
         if socket not in events:
             raise TimeoutError(f"异步RPC调用 {event_type} 超时（{timeout}s）")
         payload = await socket.recv()
-        result_data = deserialize_data(payload)
+        result_data = deserialize_data(payload, self.serialization)
         if isinstance(result_data, dict) and "error" in result_data:
             raise RuntimeError(f"Async RPC Remote Error: {result_data['error']}")
         result = result_data.get("data")
@@ -493,22 +529,32 @@ class EventApp:
         poller = zmq.Poller()
         poller.register(self._event_pull, zmq.POLLIN)
         poller.register(self._rpc_rep, zmq.POLLIN)
-        while True:
-            events = dict(poller.poll(1000))
+        executor = self._get_executor()
+        futures = []
+        while self._running.is_set():
+            events = dict(poller.poll(self.block_timeout_ms))
             if self._event_pull in events:
                 payload = self._event_pull.recv()
-                publish_data = deserialize_data(payload)
+                publish_data = deserialize_data(payload, self.serialization)
                 event_type = publish_data.get("event_type")
                 if event_type:
-                    self._process_event(event_type, publish_data)
+                    future = executor.submit(self._process_event_wrapper, event_type, publish_data)
+                    futures.append(future)
             if self._rpc_rep in events:
                 payload = self._rpc_rep.recv()
-                publish_data = deserialize_data(payload)
+                publish_data = deserialize_data(payload, self.serialization)
                 event_type = publish_data.get("event_type")
                 response = {"request_id": publish_data.get("request_id"), "error": "invalid request"}
                 if event_type:
                     response = self._process_event(event_type, publish_data) or response
-                self._rpc_rep.send(serialize_data(response))
+                self._rpc_rep.send(serialize_data(response, self.serialization))
+            futures = [f for f in futures if not f.done()]
+
+    def _process_event_wrapper(self, event_type: str, publish_data: dict):
+        try:
+            self._process_event(event_type, publish_data)
+        except Exception as e:
+            print(f"事件处理异常: {e}")
 
     def run(self, block: bool = True):
         if block:
@@ -517,6 +563,11 @@ class EventApp:
             listener_thread = multiprocessing.Process(target=self._listen_loop)
             listener_thread.daemon = True
             listener_thread.start()
+
+    def stop(self):
+        self._running.clear()
+        if self._executor:
+            self._executor.shutdown(wait=False)
 
     async def run_async(self):
         self._init_async_context()
@@ -535,18 +586,18 @@ class EventApp:
         poller.register(self._async_event_pull, zmq.POLLIN)
         poller.register(self._async_rpc_rep, zmq.POLLIN)
         while True:
-            events = dict(await poller.poll(1000))
+            events = dict(await poller.poll(self.block_timeout_ms))
             if self._async_event_pull in events:
                 payload = await self._async_event_pull.recv()
-                publish_data = deserialize_data(payload)
+                publish_data = deserialize_data(payload, self.serialization)
                 event_type = publish_data.get("event_type")
                 if event_type:
                     await self._process_event_async(event_type, publish_data)
             if self._async_rpc_rep in events:
                 payload = await self._async_rpc_rep.recv()
-                publish_data = deserialize_data(payload)
+                publish_data = deserialize_data(payload, self.serialization)
                 event_type = publish_data.get("event_type")
                 response = {"request_id": publish_data.get("request_id"), "error": "invalid request"}
                 if event_type:
                     response = await self._process_event_async(event_type, publish_data) or response
-                await self._async_rpc_rep.send(serialize_data(response))
+                await self._async_rpc_rep.send(serialize_data(response, self.serialization))
